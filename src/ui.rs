@@ -16,13 +16,13 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn test_counter_empty() {
+    fn test_word_and_char_counter_empty() {
         assert_eq!(count_words_and_chars(""), (0, 0));
         assert_eq!(count_words_and_chars("   \n\t  "), (0, 0));
     }
 
     #[test]
-    fn test_counter_words_and_unicode() {
+    fn test_word_and_char_counter_unicode_and_multiline() {
         assert_eq!(count_words_and_chars("hello world"), (2, 11));
         assert_eq!(
             count_words_and_chars("Merhaba dünya! Şekerli çay."),

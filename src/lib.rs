@@ -271,7 +271,23 @@ impl cosmic::Application for ScratchpadApp {
             let spacing = cosmic_theme.cosmic().spacing;
 
             // 1. Header: Pill Tabs (Left) and Quick Action Buttons (Right)
-            let tab_names = [fl!("tab-notes"), fl!("tab-snippets"), fl!("tab-scratch")];
+            let tab_names = [
+                if self.config.tab_names[0] == "Notes" {
+                    fl!("tab-notes")
+                } else {
+                    self.config.tab_names[0].clone()
+                },
+                if self.config.tab_names[1] == "Snippets" {
+                    fl!("tab-snippets")
+                } else {
+                    self.config.tab_names[1].clone()
+                },
+                if self.config.tab_names[2] == "Scratch" {
+                    fl!("tab-scratch")
+                } else {
+                    self.config.tab_names[2].clone()
+                },
+            ];
 
             let mut tab_buttons = Vec::with_capacity(storage::TOTAL_PADS);
             for (i, name) in tab_names.into_iter().enumerate() {

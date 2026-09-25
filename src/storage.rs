@@ -75,26 +75,59 @@ pub mod tests {
     use super::*;
 
     #[test]
-    fn test_atomic_write_creates_and_overwrites() {
-        let temp_dir = std::env::temp_dir().join(format!("scratchpad_test_{}", std::process::id()));
+    fn test_atomic_write_creates_file_and_parent_dirs() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_create_test_{}", std::process::id()));
+        let file_path = temp_dir.join("nested").join("dirs").join("pad_1.md");
+
+        let text = "Hello nested directory!";
+        atomic_write(&file_path, text).expect("Failed to create file and parent dirs");
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), text);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_atomic_write_overwrites_cleanly() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_overwrite_test_{}", std::process::id()));
         let file_path = temp_dir.join("pad_1.md");
 
-        let initial_text = "# Hello World\nTesting initial atomic write.";
-        atomic_write(&file_path, initial_text).expect("Failed initial atomic write");
+        let initial_text = "# Initial Content";
+        atomic_write(&file_path, initial_text).expect("Failed initial write");
         assert_eq!(fs::read_to_string(&file_path).unwrap(), initial_text);
 
-        let updated_text = "# Hello Again\nTesting overwrite.";
-        atomic_write(&file_path, updated_text).expect("Failed overwrite atomic write");
+        let updated_text = "# Updated Content";
+        atomic_write(&file_path, updated_text).expect("Failed overwrite");
         assert_eq!(fs::read_to_string(&file_path).unwrap(), updated_text);
 
-        // Verify no leftover .tmp files
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_atomic_write_leaves_no_stale_tmp_files() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_tmp_test_{}", std::process::id()));
+        let file_path = temp_dir.join("pad_1.md");
+
+        atomic_write(&file_path, "Test without leftover").expect("Failed atomic write");
+
         let entries: Vec<_> = fs::read_dir(&temp_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
+
         assert_eq!(entries, vec!["pad_1.md"]);
+        assert!(entries.iter().all(|name| !name.contains(".tmp.")));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_pad_fallback_to_empty() {
+        // High pad index that doesn't exist
+        let result = load_pad(999).unwrap();
+        assert_eq!(result, "");
     }
 
     #[test]

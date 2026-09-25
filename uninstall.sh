@@ -23,6 +23,7 @@ if command -v gtk-update-icon-cache &>/dev/null; then
     gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
 fi
 
+killall cosmic-ext-applet-scratchpad 2>/dev/null || true
 killall cosmic-panel 2>/dev/null || true
 
 echo "COSMIC Scratchpad applet successfully uninstalled."

@@ -31,21 +31,40 @@ impl Default for ScratchpadConfig {
     }
 }
 
+impl ScratchpadConfig {
+    /// Sanitizes configuration values ensuring active_tab and font_size are within valid bounds.
+    pub fn sanitize(&mut self) {
+        self.active_tab = self
+            .active_tab
+            .min(crate::storage::TOTAL_PADS.saturating_sub(1));
+        if self.font_size.is_nan() || self.font_size < 10.0 || self.font_size > 24.0 {
+            self.font_size = if self.font_size.is_nan() {
+                14.0
+            } else {
+                self.font_size.clamp(10.0, 24.0)
+            };
+        }
+    }
+}
+
 pub fn load_config() -> (Option<Config>, ScratchpadConfig) {
     match Config::new(CONFIG_ID, ScratchpadConfig::VERSION) {
         Ok(handler) => {
-            let config = match ScratchpadConfig::get_entry(&handler) {
+            let mut config = match ScratchpadConfig::get_entry(&handler) {
                 Ok(cfg) => cfg,
                 Err(err) => {
                     tracing::debug!(?err, "Could not read config entry, using defaults");
                     ScratchpadConfig::default()
                 }
             };
+            config.sanitize();
             (Some(handler), config)
         }
         Err(err) => {
             tracing::debug!(?err, "Could not open cosmic-config handler");
-            (None, ScratchpadConfig::default())
+            let mut config = ScratchpadConfig::default();
+            config.sanitize();
+            (None, config)
         }
     }
 }
@@ -70,11 +89,35 @@ pub mod tests {
 
     #[test]
     fn test_config_active_tab_bounds() {
-        let config = ScratchpadConfig {
+        let mut config = ScratchpadConfig {
             active_tab: 5,
             ..Default::default()
         };
-        let clamped = config.active_tab.min(crate::storage::TOTAL_PADS - 1);
-        assert_eq!(clamped, 2);
+        config.sanitize();
+        assert_eq!(config.active_tab, 2);
+    }
+
+    #[test]
+    fn test_config_font_size_bounds_and_nan() {
+        let mut config_nan = ScratchpadConfig {
+            font_size: f32::NAN,
+            ..Default::default()
+        };
+        config_nan.sanitize();
+        assert_eq!(config_nan.font_size, 14.0);
+
+        let mut config_zero = ScratchpadConfig {
+            font_size: 0.0,
+            ..Default::default()
+        };
+        config_zero.sanitize();
+        assert_eq!(config_zero.font_size, 10.0);
+
+        let mut config_huge = ScratchpadConfig {
+            font_size: 99.0,
+            ..Default::default()
+        };
+        config_huge.sanitize();
+        assert_eq!(config_huge.font_size, 24.0);
     }
 }

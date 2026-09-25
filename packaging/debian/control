@@ -2,7 +2,7 @@ Source: cosmic-ext-applet-scratchpad
 Section: misc
 Priority: optional
 Maintainer: Hasan Hüseyin Yolcu <hasanhuseyinyolcu25@gmail.com>
-Build-Depends: debhelper-compat (= 13), cargo, just, pkg-config, libxkbcommon-dev, libwayland-dev
+Build-Depends: debhelper-compat (= 13), cargo, just, pkg-config, cmake, libexpat1-dev, libfontconfig-dev, libfreetype-dev, libxkbcommon-dev, libwayland-dev
 Standards-Version: 4.6.2
 Homepage: https://github.com/Hasmolam/cosmic-ext-applet-scratchpad
 

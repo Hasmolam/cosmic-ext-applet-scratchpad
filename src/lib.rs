@@ -7,10 +7,11 @@ pub mod ui;
 
 use config::{ScratchpadConfig, load_config};
 use cosmic::cosmic_config::CosmicConfigEntry;
+use cosmic::iced::core::keyboard::{Key, key::Named};
 use cosmic::iced::widget::{column, row};
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window};
 use cosmic::widget::text_editor::{Action, Content};
-use cosmic::widget::{button, container, icon, space, text, text_editor};
+use cosmic::widget::{button, container, icon, space, text, text_editor, tooltip};
 use cosmic::{Element, app, theme};
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
@@ -34,13 +35,14 @@ pub enum Message {
     EditorAction(Action),
     DebounceTimeout(usize),
     CopyAll,
-    ResetCopyStatus,
+    ResetCopyStatus(u64),
     ClearNote,
     UndoClear,
-    DismissUndoBanner,
+    DismissUndoBanner(u64),
     ToggleSettings,
     ToggleWrapLines,
     AdjustFontSize(f32),
+    EscapePressed,
     Surface(cosmic::surface::Action<Message>),
 }
 
@@ -51,12 +53,15 @@ pub struct ScratchpadApp {
     popup: Option<window::Id>,
     active_tab: usize,
     contents: [Content; storage::TOTAL_PADS],
+    word_char_counts: [(usize, usize); storage::TOTAL_PADS],
     last_edit_time: [Option<Instant>; storage::TOTAL_PADS],
     last_mtimes: [Option<SystemTime>; storage::TOTAL_PADS],
     saved_status: [bool; storage::TOTAL_PADS],
     copied_recently: bool,
+    copy_generation: u64,
     show_settings: bool,
-    undo_cache: Option<(usize, String)>,
+    undo_generation: u64,
+    undo_cache: Option<(u64, usize, String)>,
 }
 
 impl ScratchpadApp {
@@ -99,8 +104,10 @@ impl cosmic::Application for ScratchpadApp {
         let mut contents: [Content; storage::TOTAL_PADS] = Default::default();
         let mut last_mtimes: [Option<SystemTime>; storage::TOTAL_PADS] =
             [None; storage::TOTAL_PADS];
+        let mut word_char_counts = [(0, 0); storage::TOTAL_PADS];
         for (i, content) in contents.iter_mut().enumerate() {
             let initial_text = storage::load_pad(i).unwrap_or_default();
+            word_char_counts[i] = ui::count_words_and_chars(&initial_text);
             *content = Content::with_text(&initial_text);
             last_mtimes[i] = storage::get_pad_mtime(i);
         }
@@ -112,11 +119,14 @@ impl cosmic::Application for ScratchpadApp {
             popup: None,
             active_tab,
             contents,
+            word_char_counts,
             last_edit_time: [None; storage::TOTAL_PADS],
             last_mtimes,
             saved_status: [true; storage::TOTAL_PADS],
             copied_recently: false,
+            copy_generation: 0,
             show_settings: false,
+            undo_generation: 0,
             undo_cache: None,
         };
 
@@ -145,6 +155,7 @@ impl cosmic::Application for ScratchpadApp {
                         self.last_mtimes[self.active_tab],
                     )
                 {
+                    self.word_char_counts[self.active_tab] = ui::count_words_and_chars(&reloaded);
                     self.contents[self.active_tab] = Content::with_text(&reloaded);
                     self.last_mtimes[self.active_tab] = Some(new_mtime);
                 }
@@ -194,6 +205,7 @@ impl cosmic::Application for ScratchpadApp {
                         && let Ok(Some((reloaded, new_mtime))) =
                             storage::load_pad_if_modified(index, self.last_mtimes[index])
                     {
+                        self.word_char_counts[index] = ui::count_words_and_chars(&reloaded);
                         self.contents[index] = Content::with_text(&reloaded);
                         self.last_mtimes[index] = Some(new_mtime);
                     }
@@ -215,6 +227,8 @@ impl cosmic::Application for ScratchpadApp {
                 if is_edit {
                     self.saved_status[tab] = false;
                     self.last_edit_time[tab] = Some(Instant::now());
+                    let text = self.current_text(tab);
+                    self.word_char_counts[tab] = ui::count_words_and_chars(&text);
 
                     app::Task::future(async move {
                         tokio::time::sleep(Duration::from_millis(DEBOUNCE_MILLIS)).await;
@@ -237,18 +251,22 @@ impl cosmic::Application for ScratchpadApp {
             Message::CopyAll => {
                 let text_to_copy = self.current_text(self.active_tab);
                 self.copied_recently = true;
+                self.copy_generation = self.copy_generation.wrapping_add(1);
+                let generation = self.copy_generation;
 
                 let copy_task = cosmic::iced::clipboard::write(text_to_copy);
                 let reset_task = app::Task::future(async move {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
-                    cosmic::Action::App(Message::ResetCopyStatus)
+                    cosmic::Action::App(Message::ResetCopyStatus(generation))
                 });
 
                 app::Task::batch([copy_task, reset_task])
             }
 
-            Message::ResetCopyStatus => {
-                self.copied_recently = false;
+            Message::ResetCopyStatus(target_gen) => {
+                if self.copy_generation == target_gen {
+                    self.copied_recently = false;
+                }
                 app::Task::none()
             }
 
@@ -256,13 +274,19 @@ impl cosmic::Application for ScratchpadApp {
                 let tab = self.active_tab;
                 let previous_text = self.current_text(tab);
                 if !previous_text.is_empty() {
-                    self.undo_cache = Some((tab, previous_text));
+                    if let Err(err) = storage::create_pad_backup(tab) {
+                        tracing::warn!(?err, tab, "Could not create backup before note clear");
+                    }
+                    self.undo_generation = self.undo_generation.wrapping_add(1);
+                    let generation = self.undo_generation;
+                    self.undo_cache = Some((generation, tab, previous_text));
                     self.contents[tab] = Content::with_text("");
+                    self.word_char_counts[tab] = (0, 0);
                     self.save_current_pad_if_dirty(tab);
 
                     app::Task::future(async move {
                         tokio::time::sleep(Duration::from_secs(UNDO_BANNER_SECS)).await;
-                        cosmic::Action::App(Message::DismissUndoBanner)
+                        cosmic::Action::App(Message::DismissUndoBanner(generation))
                     })
                 } else {
                     app::Task::none()
@@ -270,15 +294,20 @@ impl cosmic::Application for ScratchpadApp {
             }
 
             Message::UndoClear => {
-                if let Some((tab, text)) = self.undo_cache.take() {
+                if let Some((_, tab, text)) = self.undo_cache.take() {
                     self.contents[tab] = Content::with_text(&text);
+                    self.word_char_counts[tab] = ui::count_words_and_chars(&text);
                     self.save_current_pad_if_dirty(tab);
                 }
                 app::Task::none()
             }
 
-            Message::DismissUndoBanner => {
-                self.undo_cache = None;
+            Message::DismissUndoBanner(target_gen) => {
+                if let Some((g, _, _)) = self.undo_cache
+                    && g == target_gen
+                {
+                    self.undo_cache = None;
+                }
                 app::Task::none()
             }
 
@@ -309,11 +338,47 @@ impl cosmic::Application for ScratchpadApp {
                 }
                 app::Task::none()
             }
+
+            Message::EscapePressed => {
+                if let Some(p) = self.popup.take() {
+                    self.save_current_pad_if_dirty(self.active_tab);
+                    return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
+                        p,
+                    ));
+                }
+                app::Task::none()
+            }
         }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::none()
+        if self.popup.is_some() {
+            cosmic::iced::keyboard::listen().filter_map(|event| {
+                if let cosmic::iced::core::keyboard::Event::KeyPressed { key, modifiers, .. } =
+                    event
+                {
+                    if key
+                        == cosmic::iced::core::keyboard::Key::Named(
+                            cosmic::iced::core::keyboard::key::Named::Escape,
+                        )
+                    {
+                        Some(Message::EscapePressed)
+                    } else if modifiers.command()
+                        && modifiers.shift()
+                        && (key.as_ref() == cosmic::iced::core::keyboard::Key::Character("c")
+                            || key.as_ref() == cosmic::iced::core::keyboard::Key::Character("C"))
+                    {
+                        Some(Message::CopyAll)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        } else {
+            Subscription::none()
+        }
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -374,6 +439,12 @@ impl cosmic::Application for ScratchpadApp {
                     .symbolic(true)
             };
 
+            let copy_tooltip_text = if self.copied_recently {
+                fl!("action-copied")
+            } else {
+                format!("{} (Ctrl+Shift+C)", fl!("action-copy"))
+            };
+
             let copy_btn = button::custom(copy_icon)
                 .on_press(Message::CopyAll)
                 .class(if self.copied_recently {
@@ -383,6 +454,12 @@ impl cosmic::Application for ScratchpadApp {
                 })
                 .padding([4, 6]);
 
+            let copy_with_tooltip = tooltip(
+                copy_btn,
+                text::caption(copy_tooltip_text),
+                tooltip::Position::Bottom,
+            );
+
             let clear_btn = button::custom(
                 icon::from_name("edit-clear-symbolic")
                     .size(16)
@@ -391,6 +468,12 @@ impl cosmic::Application for ScratchpadApp {
             .on_press(Message::ClearNote)
             .class(theme::Button::Text)
             .padding([4, 6]);
+
+            let clear_with_tooltip = tooltip(
+                clear_btn,
+                text::caption(fl!("action-clear")),
+                tooltip::Position::Bottom,
+            );
 
             let settings_btn = button::custom(
                 icon::from_name("preferences-system-symbolic")
@@ -405,7 +488,14 @@ impl cosmic::Application for ScratchpadApp {
             })
             .padding([4, 6]);
 
-            let actions_row = row![copy_btn, clear_btn, settings_btn].spacing(4);
+            let settings_with_tooltip = tooltip(
+                settings_btn,
+                text::caption(fl!("action-settings")),
+                tooltip::Position::Bottom,
+            );
+
+            let actions_row =
+                row![copy_with_tooltip, clear_with_tooltip, settings_with_tooltip].spacing(4);
 
             let header = row![
                 tabs_row,
@@ -464,7 +554,8 @@ impl cosmic::Application for ScratchpadApp {
             };
 
             // 3. Undo Notification Banner (discreet inline banner)
-            let maybe_undo_banner: Option<Element<_>> = if let Some((tab, _)) = &self.undo_cache {
+            let maybe_undo_banner: Option<Element<_>> = if let Some((_, tab, _)) = &self.undo_cache
+            {
                 if *tab == self.active_tab {
                     Some(
                         container(
@@ -499,6 +590,19 @@ impl cosmic::Application for ScratchpadApp {
                 } else {
                     cosmic::iced::core::text::Wrapping::None
                 })
+                .key_binding(|keypress| {
+                    if keypress.key == Key::Named(Named::Escape) {
+                        Some(text_editor::Binding::Custom(Message::EscapePressed))
+                    } else if keypress.modifiers.command()
+                        && keypress.modifiers.shift()
+                        && (keypress.key.as_ref() == Key::Character("c")
+                            || keypress.key.as_ref() == Key::Character("C"))
+                    {
+                        Some(text_editor::Binding::Custom(Message::CopyAll))
+                    } else {
+                        text_editor::Binding::from_key_press(keypress)
+                    }
+                })
                 .height(Length::Fill)
                 .padding(10)
                 .on_action(Message::EditorAction);
@@ -509,8 +613,7 @@ impl cosmic::Application for ScratchpadApp {
                 .class(theme::Container::Card);
 
             // 5. Footer: Word & Character Counter (Left), Save Status (Right)
-            let current_text = self.current_text(self.active_tab);
-            let (words, chars) = ui::count_words_and_chars(&current_text);
+            let (words, chars) = self.word_char_counts[self.active_tab];
 
             let counter_label = text::caption(fl!("status-count", words = words, chars = chars));
 

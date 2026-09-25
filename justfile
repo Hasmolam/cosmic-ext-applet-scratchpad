@@ -27,12 +27,18 @@ check:
 	cargo clippy -- -D warnings
 	cargo test
 
-install:
+install: build
 	install -Dm0755 {{ bin-src }} {{ bin-dst }}
 	install -Dm0644 data/icons/scalable/apps/{{ APPID }}-symbolic.svg {{ icon-dst }}
 	install -Dm0644 data/{{ APPID }}.desktop {{ desktop-dst }}
+
+install-user:
+	just prefix={{ env_var('HOME') }}/.local install
 
 uninstall:
 	rm -f {{ bin-dst }}
 	rm -f {{ icon-dst }}
 	rm -f {{ desktop-dst }}
+
+uninstall-user:
+	just prefix={{ env_var('HOME') }}/.local uninstall

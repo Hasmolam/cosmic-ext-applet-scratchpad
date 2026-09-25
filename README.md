@@ -69,8 +69,11 @@ sudo apt-get install -y cmake libexpat1-dev libfontconfig-dev libfreetype-dev li
 git clone https://github.com/Hasmolam/cosmic-ext-applet-scratchpad.git
 cd cosmic-ext-applet-scratchpad
 
-just build
-./install.sh
+# System-wide installation (installs to /usr, requires sudo):
+sudo just install
+
+# Or user-local installation (installs to ~/.local, no root required):
+just install-user
 ```
 
 ### Adding to the Panel
@@ -109,7 +112,9 @@ curl -fsSL https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchp
 Or from a local repository clone:
 
 ```bash
-./uninstall.sh
+sudo just uninstall
+# or for user-local install:
+just uninstall-user
 ```
 
 *(Note: User notes in `~/.local/share/cosmic-scratchpad/` are preserved).*

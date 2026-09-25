@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	just build
+
+override_dh_auto_install:
+	just rootdir=debian/cosmic-ext-applet-scratchpad prefix=/usr install

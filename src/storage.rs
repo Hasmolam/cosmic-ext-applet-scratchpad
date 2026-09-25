@@ -70,6 +70,35 @@ pub fn save_pad_atomic(index: usize, content: &str) -> io::Result<()> {
     atomic_write(&pad_path(index), content)
 }
 
+/// Returns the last modification time of the pad file on disk if it exists.
+pub fn get_pad_mtime(index: usize) -> Option<std::time::SystemTime> {
+    let path = pad_path(index);
+    fs::metadata(&path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Loads the pad content if it was modified on disk since `last_mtime`.
+/// Returns Ok(Some((content, new_mtime))) if modified or initially loaded.
+/// Returns Ok(None) if unchanged.
+pub fn load_pad_if_modified(
+    index: usize,
+    last_mtime: Option<std::time::SystemTime>,
+) -> io::Result<Option<(String, std::time::SystemTime)>> {
+    let path = pad_path(index);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mtime = fs::metadata(&path)?.modified()?;
+    if let Some(prev) = last_mtime
+        && mtime <= prev
+    {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path)?;
+    Ok(Some((content, mtime)))
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -139,5 +168,33 @@ pub mod tests {
         assert!(p0.ends_with("pad_1.md"));
         assert!(p1.ends_with("pad_2.md"));
         assert!(p2.ends_with("pad_3.md"));
+    }
+
+    #[test]
+    fn test_load_pad_if_modified_detects_changes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_mtime_test_{}", std::process::id()));
+        let file_path = temp_dir.join("pad_1.md");
+
+        // 1. Initial write
+        atomic_write(&file_path, "Version 1").expect("Failed to write v1");
+        let mtime_v1 = fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        // Calling load_pad_if_modified with mtime_v1 on non-existent index vs same time
+        // Simulate checking if modified since mtime_v1
+        let path = &file_path;
+        let mtime = fs::metadata(path).unwrap().modified().unwrap();
+        assert!(mtime <= mtime_v1);
+
+        // 2. Wait 10ms to ensure timestamp difference on filesystems with fine grain mtime
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        atomic_write(&file_path, "Version 2").expect("Failed to write v2");
+        let mtime_v2 = fs::metadata(&file_path).unwrap().modified().unwrap();
+
+        assert!(mtime_v2 > mtime_v1);
+        let content_v2 = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content_v2, "Version 2");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

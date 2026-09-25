@@ -1,0 +1,15 @@
+Source: cosmic-ext-applet-scratchpad
+Section: misc
+Priority: optional
+Maintainer: Hasan Hüseyin Yolcu <hasanhuseyinyolcu25@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo, just, pkg-config, libxkbcommon-dev, libwayland-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/Hasmolam/cosmic-ext-applet-scratchpad
+
+Package: cosmic-ext-applet-scratchpad
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Minimalist quick notes and scratchpad applet for the COSMIC Desktop
+ An unobtrusive scratchpad applet embedded directly into the COSMIC panel
+ for taking quick notes, drafting commands, and saving snippets with atomic
+ persistence and zero lag.

@@ -11,3 +11,6 @@ status-saved = Saved
 status-editing = Editing...
 status-count = { $words } words · { $chars } chars
 banner-cleared = Note cleared.
+action-settings = Settings
+setting-word-wrap = Word Wrap
+setting-font-size = Font Size: { $size }pt

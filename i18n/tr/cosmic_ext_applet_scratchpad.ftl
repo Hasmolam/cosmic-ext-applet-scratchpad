@@ -11,3 +11,6 @@ status-saved = Kaydedildi
 status-editing = Düzenleniyor...
 status-count = { $words } kelime · { $chars } karakter
 banner-cleared = Not temizlendi.
+action-settings = Ayarlar
+setting-word-wrap = Satır Kaydırma
+setting-font-size = Yazı Boyutu: { $size }pt

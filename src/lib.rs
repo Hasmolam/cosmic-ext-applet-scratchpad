@@ -12,7 +12,7 @@ use cosmic::iced::{Alignment, Length, Limits, Subscription, window};
 use cosmic::widget::text_editor::{Action, Content};
 use cosmic::widget::{button, container, icon, space, text, text_editor};
 use cosmic::{Element, app, theme};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 pub const APP_ID: &str = "io.github.hasmolam.cosmic-ext-applet-scratchpad";
@@ -38,6 +38,9 @@ pub enum Message {
     ClearNote,
     UndoClear,
     DismissUndoBanner,
+    ToggleSettings,
+    ToggleWrapLines,
+    AdjustFontSize(f32),
     Surface(cosmic::surface::Action<Message>),
 }
 
@@ -49,8 +52,10 @@ pub struct ScratchpadApp {
     active_tab: usize,
     contents: [Content; storage::TOTAL_PADS],
     last_edit_time: [Option<Instant>; storage::TOTAL_PADS],
+    last_mtimes: [Option<SystemTime>; storage::TOTAL_PADS],
     saved_status: [bool; storage::TOTAL_PADS],
     copied_recently: bool,
+    show_settings: bool,
     undo_cache: Option<(usize, String)>,
 }
 
@@ -67,6 +72,7 @@ impl ScratchpadApp {
             } else {
                 self.saved_status[index] = true;
                 self.last_edit_time[index] = None;
+                self.last_mtimes[index] = storage::get_pad_mtime(index);
             }
         }
     }
@@ -91,9 +97,12 @@ impl cosmic::Application for ScratchpadApp {
         let active_tab = config.active_tab.min(storage::TOTAL_PADS - 1);
 
         let mut contents: [Content; storage::TOTAL_PADS] = Default::default();
+        let mut last_mtimes: [Option<SystemTime>; storage::TOTAL_PADS] =
+            [None; storage::TOTAL_PADS];
         for (i, content) in contents.iter_mut().enumerate() {
             let initial_text = storage::load_pad(i).unwrap_or_default();
             *content = Content::with_text(&initial_text);
+            last_mtimes[i] = storage::get_pad_mtime(i);
         }
 
         let app = Self {
@@ -104,8 +113,10 @@ impl cosmic::Application for ScratchpadApp {
             active_tab,
             contents,
             last_edit_time: [None; storage::TOTAL_PADS],
+            last_mtimes,
             saved_status: [true; storage::TOTAL_PADS],
             copied_recently: false,
+            show_settings: false,
             undo_cache: None,
         };
 
@@ -125,6 +136,17 @@ impl cosmic::Application for ScratchpadApp {
                     return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
                         p,
                     ));
+                }
+
+                // If opening, check for external disk edits on the active tab
+                if self.saved_status[self.active_tab]
+                    && let Ok(Some((reloaded, new_mtime))) = storage::load_pad_if_modified(
+                        self.active_tab,
+                        self.last_mtimes[self.active_tab],
+                    )
+                {
+                    self.contents[self.active_tab] = Content::with_text(&reloaded);
+                    self.last_mtimes[self.active_tab] = Some(new_mtime);
                 }
 
                 cosmic::surface::surface_task(cosmic::surface::action::app_popup(
@@ -166,6 +188,15 @@ impl cosmic::Application for ScratchpadApp {
                     self.save_current_pad_if_dirty(self.active_tab);
                     self.active_tab = index;
                     self.config.active_tab = index;
+
+                    // Check for external disk edits on the newly selected tab
+                    if self.saved_status[index]
+                        && let Ok(Some((reloaded, new_mtime))) =
+                            storage::load_pad_if_modified(index, self.last_mtimes[index])
+                    {
+                        self.contents[index] = Content::with_text(&reloaded);
+                        self.last_mtimes[index] = Some(new_mtime);
+                    }
 
                     if let Some(handler) = &self.config_handler
                         && let Err(err) = self.config.write_entry(handler)
@@ -248,6 +279,34 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::DismissUndoBanner => {
                 self.undo_cache = None;
+                app::Task::none()
+            }
+
+            Message::ToggleSettings => {
+                self.show_settings = !self.show_settings;
+                app::Task::none()
+            }
+
+            Message::ToggleWrapLines => {
+                self.config.wrap_lines = !self.config.wrap_lines;
+                if let Some(handler) = &self.config_handler
+                    && let Err(err) = self.config.write_entry(handler)
+                {
+                    tracing::warn!(?err, "Could not persist wrap_lines config");
+                }
+                app::Task::none()
+            }
+
+            Message::AdjustFontSize(delta) => {
+                let new_size = (self.config.font_size + delta).clamp(10.0, 24.0);
+                if (new_size - self.config.font_size).abs() > f32::EPSILON {
+                    self.config.font_size = new_size;
+                    if let Some(handler) = &self.config_handler
+                        && let Err(err) = self.config.write_entry(handler)
+                    {
+                        tracing::warn!(?err, "Could not persist font_size config");
+                    }
+                }
                 app::Task::none()
             }
         }
@@ -333,7 +392,20 @@ impl cosmic::Application for ScratchpadApp {
             .class(theme::Button::Text)
             .padding([4, 6]);
 
-            let actions_row = row![copy_btn, clear_btn].spacing(4);
+            let settings_btn = button::custom(
+                icon::from_name("preferences-system-symbolic")
+                    .size(16)
+                    .symbolic(true),
+            )
+            .on_press(Message::ToggleSettings)
+            .class(if self.show_settings {
+                theme::Button::Suggested
+            } else {
+                theme::Button::Text
+            })
+            .padding([4, 6]);
+
+            let actions_row = row![copy_btn, clear_btn, settings_btn].spacing(4);
 
             let header = row![
                 tabs_row,
@@ -343,7 +415,55 @@ impl cosmic::Application for ScratchpadApp {
             .align_y(Alignment::Center)
             .width(Length::Fill);
 
-            // 2. Undo Notification Banner (discreet inline banner)
+            // 2. Settings Drawer (Collapsible)
+            let maybe_settings_drawer: Option<Element<_>> = if self.show_settings {
+                let wrap_btn = button::text(fl!("setting-word-wrap"))
+                    .on_press(Message::ToggleWrapLines)
+                    .class(if self.config.wrap_lines {
+                        theme::Button::Suggested
+                    } else {
+                        theme::Button::Text
+                    })
+                    .padding([2, 8]);
+
+                let dec_btn = button::text("-")
+                    .on_press(Message::AdjustFontSize(-1.0))
+                    .class(theme::Button::Text)
+                    .padding([2, 6]);
+
+                let font_label = text::caption(fl!(
+                    "setting-font-size",
+                    size = (self.config.font_size as u32)
+                ));
+
+                let inc_btn = button::text("+")
+                    .on_press(Message::AdjustFontSize(1.0))
+                    .class(theme::Button::Text)
+                    .padding([2, 6]);
+
+                let font_controls = row![dec_btn, font_label, inc_btn]
+                    .align_y(Alignment::Center)
+                    .spacing(2);
+
+                Some(
+                    container(
+                        row![
+                            wrap_btn,
+                            space::horizontal().width(Length::Fill),
+                            font_controls
+                        ]
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                    )
+                    .padding([4, 8])
+                    .class(theme::Container::Card)
+                    .into(),
+                )
+            } else {
+                None
+            };
+
+            // 3. Undo Notification Banner (discreet inline banner)
             let maybe_undo_banner: Option<Element<_>> = if let Some((tab, _)) = &self.undo_cache {
                 if *tab == self.active_tab {
                     Some(
@@ -370,9 +490,15 @@ impl cosmic::Application for ScratchpadApp {
                 None
             };
 
-            // 3. Text Editor
+            // 4. Text Editor with Font Size & Line Wrapping
             let editor = text_editor::text_editor(&self.contents[self.active_tab])
                 .placeholder(fl!("placeholder"))
+                .size(self.config.font_size)
+                .wrapping(if self.config.wrap_lines {
+                    cosmic::iced::core::text::Wrapping::Word
+                } else {
+                    cosmic::iced::core::text::Wrapping::None
+                })
                 .height(Length::Fill)
                 .padding(10)
                 .on_action(Message::EditorAction);
@@ -382,7 +508,7 @@ impl cosmic::Application for ScratchpadApp {
                 .height(Length::Fill)
                 .class(theme::Container::Card);
 
-            // 4. Footer: Word & Character Counter (Left), Save Status (Right)
+            // 5. Footer: Word & Character Counter (Left), Save Status (Right)
             let current_text = self.current_text(self.active_tab);
             let (words, chars) = ui::count_words_and_chars(&current_text);
 
@@ -403,8 +529,11 @@ impl cosmic::Application for ScratchpadApp {
             .width(Length::Fill);
 
             // Assemble Popover Content
-            let mut content_elements = Vec::with_capacity(4);
+            let mut content_elements = Vec::with_capacity(5);
             content_elements.push(header.into());
+            if let Some(settings) = maybe_settings_drawer {
+                content_elements.push(settings);
+            }
             if let Some(banner) = maybe_undo_banner {
                 content_elements.push(banner);
             }

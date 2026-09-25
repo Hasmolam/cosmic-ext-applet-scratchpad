@@ -1,0 +1,32 @@
+[package]
+name = "cosmic-ext-applet-scratchpad"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "GPL-3.0-only"
+description = "Minimalist quick notes and scratchpad applet for the COSMIC Desktop"
+authors = ["Hasan Hüseyin Yolcu <hasanhuseyinyolcu25@gmail.com>"]
+
+[dependencies]
+# COSMIC Applet UI (bundles tokio and cosmic-config)
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["applet"] }
+
+# Serialization for configuration & preferences
+serde = { version = "1.0", features = ["derive"] }
+
+# Structured error handling & logging
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Localization (Fluent)
+i18n-embed = { version = "0.15", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8.5"
+
+# Async runtime primitives
+tokio = { version = "1", features = ["time", "macros", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+

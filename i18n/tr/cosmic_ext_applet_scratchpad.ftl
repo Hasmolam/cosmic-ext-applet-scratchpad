@@ -1,0 +1,13 @@
+app-title = Karalama Defteri
+placeholder = Hızlı bir not, komut veya kod parçası yazın...
+tab-notes = Notlar
+tab-snippets = Parçalar
+tab-scratch = Karalama
+action-copy = Tümünü Kopyala
+action-copied = Kopyalandı!
+action-clear = Temizle
+action-undo = Geri Al
+status-saved = Kaydedildi
+status-editing = Düzenleniyor...
+status-count = { $words } kelime · { $chars } karakter
+banner-cleared = Not temizlendi.

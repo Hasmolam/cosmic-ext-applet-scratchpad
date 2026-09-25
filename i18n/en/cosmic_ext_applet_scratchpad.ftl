@@ -1,0 +1,13 @@
+app-title = Scratchpad
+placeholder = Jot down a quick thought, command, or snippet...
+tab-notes = Notes
+tab-snippets = Snippets
+tab-scratch = Scratch
+action-copy = Copy All
+action-copied = Copied!
+action-clear = Clear
+action-undo = Undo
+status-saved = Saved
+status-editing = Editing...
+status-count = { $words } words · { $chars } chars
+banner-cleared = Note cleared.

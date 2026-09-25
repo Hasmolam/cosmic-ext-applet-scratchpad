@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Scratchpad
+Comment=Minimalist quick notes and code scratchpad for COSMIC
+Exec=cosmic-ext-applet-scratchpad
+Icon=io.github.hasmolam.cosmic-ext-applet-scratchpad-symbolic
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+X-CosmicApplet=true
+NoDisplay=true

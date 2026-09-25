@@ -1,0 +1,394 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
+pub mod config;
+mod localize;
+pub mod storage;
+pub mod ui;
+
+use config::{ScratchpadConfig, load_config};
+use cosmic::applet::padded_control;
+use cosmic::cosmic_config::CosmicConfigEntry;
+use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
+use cosmic::iced::widget::{column, row};
+use cosmic::iced::{Alignment, Length, Subscription, window};
+use cosmic::widget::text_editor::{Action, Content};
+use cosmic::widget::{button, container, icon, space, text, text_editor};
+use cosmic::{Element, app, theme};
+use std::time::Duration;
+use tokio::time::Instant;
+
+pub const APP_ID: &str = "io.github.hasmolam.cosmic-ext-applet-scratchpad";
+const POPUP_WIDTH: f32 = 380.0;
+const POPUP_HEIGHT: f32 = 440.0;
+const DEBOUNCE_MILLIS: u64 = 400;
+const UNDO_BANNER_SECS: u64 = 5;
+
+pub fn run() -> cosmic::iced::Result {
+    localize::localize();
+    cosmic::applet::run::<ScratchpadApp>(())
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    TogglePopup,
+    CloseRequested(window::Id),
+    SelectTab(usize),
+    EditorAction(Action),
+    DebounceTimeout(usize),
+    CopyAll,
+    ResetCopyStatus,
+    ClearNote,
+    UndoClear,
+    DismissUndoBanner,
+}
+
+pub struct ScratchpadApp {
+    core: cosmic::app::Core,
+    config: ScratchpadConfig,
+    config_handler: Option<cosmic::cosmic_config::Config>,
+    popup: Option<window::Id>,
+    active_tab: usize,
+    contents: [Content; storage::TOTAL_PADS],
+    last_edit_time: [Option<Instant>; storage::TOTAL_PADS],
+    saved_status: [bool; storage::TOTAL_PADS],
+    copied_recently: bool,
+    undo_cache: Option<(usize, String)>,
+}
+
+impl ScratchpadApp {
+    fn current_text(&self, index: usize) -> String {
+        self.contents[index].text()
+    }
+
+    fn save_current_pad_if_dirty(&mut self, index: usize) {
+        if !self.saved_status[index] {
+            let text = self.current_text(index);
+            if let Err(err) = storage::save_pad_atomic(index, &text) {
+                tracing::error!(?err, index, "Failed to save pad atomically");
+            } else {
+                self.saved_status[index] = true;
+                self.last_edit_time[index] = None;
+            }
+        }
+    }
+}
+
+impl cosmic::Application for ScratchpadApp {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = Message;
+    const APP_ID: &'static str = APP_ID;
+
+    fn core(&self) -> &cosmic::app::Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut cosmic::app::Core {
+        &mut self.core
+    }
+
+    fn init(core: cosmic::app::Core, _flags: Self::Flags) -> (Self, app::Task<Self::Message>) {
+        let (config_handler, config) = load_config();
+        let active_tab = config.active_tab.min(storage::TOTAL_PADS - 1);
+
+        let mut contents: [Content; storage::TOTAL_PADS] = Default::default();
+        for (i, content) in contents.iter_mut().enumerate() {
+            let initial_text = storage::load_pad(i).unwrap_or_default();
+            *content = Content::with_text(&initial_text);
+        }
+
+        let app = Self {
+            core,
+            config,
+            config_handler,
+            popup: None,
+            active_tab,
+            contents,
+            last_edit_time: [None; storage::TOTAL_PADS],
+            saved_status: [true; storage::TOTAL_PADS],
+            copied_recently: false,
+            undo_cache: None,
+        };
+
+        (app, app::Task::none())
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Self::Message> {
+        Some(Message::CloseRequested(id))
+    }
+
+    fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
+        match message {
+            Message::TogglePopup => {
+                if let Some(p) = self.popup.take() {
+                    self.save_current_pad_if_dirty(self.active_tab);
+                    return destroy_popup(p);
+                }
+
+                cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                    |_| Default::default(),
+                    |app: &mut Self| {
+                        let new_id = window::Id::unique();
+                        app.popup.replace(new_id);
+
+                        app.core.applet.get_popup_settings(
+                            app.core.main_window_id().unwrap(),
+                            new_id,
+                            None,
+                            None,
+                            None,
+                        )
+                    },
+                    None,
+                ))
+            }
+
+            Message::CloseRequested(id) => {
+                if Some(id) == self.popup {
+                    self.save_current_pad_if_dirty(self.active_tab);
+                    self.popup = None;
+                }
+                app::Task::none()
+            }
+
+            Message::SelectTab(index) => {
+                if index < storage::TOTAL_PADS && index != self.active_tab {
+                    self.save_current_pad_if_dirty(self.active_tab);
+                    self.active_tab = index;
+                    self.config.active_tab = index;
+
+                    if let Some(handler) = &self.config_handler
+                        && let Err(err) = self.config.write_entry(handler)
+                    {
+                        tracing::warn!(?err, "Could not persist active_tab config");
+                    }
+                }
+                app::Task::none()
+            }
+
+            Message::EditorAction(action) => {
+                let tab = self.active_tab;
+                let is_edit = action.is_edit();
+                self.contents[tab].perform(action);
+
+                if is_edit {
+                    self.saved_status[tab] = false;
+                    self.last_edit_time[tab] = Some(Instant::now());
+
+                    app::Task::future(async move {
+                        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MILLIS)).await;
+                        cosmic::Action::App(Message::DebounceTimeout(tab))
+                    })
+                } else {
+                    app::Task::none()
+                }
+            }
+
+            Message::DebounceTimeout(tab) => {
+                if let Some(last_time) = self.last_edit_time[tab]
+                    && last_time.elapsed() >= Duration::from_millis(DEBOUNCE_MILLIS - 50)
+                {
+                    self.save_current_pad_if_dirty(tab);
+                }
+                app::Task::none()
+            }
+
+            Message::CopyAll => {
+                let text_to_copy = self.current_text(self.active_tab);
+                self.copied_recently = true;
+
+                let copy_task = cosmic::iced::clipboard::write(text_to_copy);
+                let reset_task = app::Task::future(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    cosmic::Action::App(Message::ResetCopyStatus)
+                });
+
+                app::Task::batch([copy_task, reset_task])
+            }
+
+            Message::ResetCopyStatus => {
+                self.copied_recently = false;
+                app::Task::none()
+            }
+
+            Message::ClearNote => {
+                let tab = self.active_tab;
+                let previous_text = self.current_text(tab);
+                if !previous_text.is_empty() {
+                    self.undo_cache = Some((tab, previous_text));
+                    self.contents[tab] = Content::with_text("");
+                    self.save_current_pad_if_dirty(tab);
+
+                    app::Task::future(async move {
+                        tokio::time::sleep(Duration::from_secs(UNDO_BANNER_SECS)).await;
+                        cosmic::Action::App(Message::DismissUndoBanner)
+                    })
+                } else {
+                    app::Task::none()
+                }
+            }
+
+            Message::UndoClear => {
+                if let Some((tab, text)) = self.undo_cache.take() {
+                    self.contents[tab] = Content::with_text(&text);
+                    self.save_current_pad_if_dirty(tab);
+                }
+                app::Task::none()
+            }
+
+            Message::DismissUndoBanner => {
+                self.undo_cache = None;
+                app::Task::none()
+            }
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        Subscription::none()
+    }
+
+    fn view(&self) -> Element<'_, Self::Message> {
+        self.core
+            .applet
+            .icon_button("io.github.hasmolam.cosmic-ext-applet-scratchpad-symbolic")
+            .on_press_down(Message::TogglePopup)
+            .into()
+    }
+
+    fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
+        let cosmic_theme = theme::active();
+        let spacing = cosmic_theme.cosmic().spacing;
+
+        // 1. Header: Pill Tabs (Left) and Quick Action Buttons (Right)
+        let tab_names = [fl!("tab-notes"), fl!("tab-snippets"), fl!("tab-scratch")];
+
+        let mut tab_buttons = Vec::with_capacity(storage::TOTAL_PADS);
+        for (i, name) in tab_names.into_iter().enumerate() {
+            let is_selected = i == self.active_tab;
+            let btn = button::text(name)
+                .on_press(Message::SelectTab(i))
+                .class(if is_selected {
+                    theme::Button::Suggested
+                } else {
+                    theme::Button::Text
+                })
+                .padding([4, 10]);
+            tab_buttons.push(btn.into());
+        }
+
+        let tabs_row = row::with_children(tab_buttons).spacing(4);
+
+        let copy_icon = if self.copied_recently {
+            icon::from_name("emblem-ok-symbolic")
+                .size(16)
+                .symbolic(true)
+        } else {
+            icon::from_name("edit-copy-symbolic")
+                .size(16)
+                .symbolic(true)
+        };
+
+        let copy_btn = button::custom(copy_icon)
+            .on_press(Message::CopyAll)
+            .class(if self.copied_recently {
+                theme::Button::Suggested
+            } else {
+                theme::Button::Text
+            })
+            .padding([4, 6]);
+
+        let clear_btn = button::custom(
+            icon::from_name("edit-clear-symbolic")
+                .size(16)
+                .symbolic(true),
+        )
+        .on_press(Message::ClearNote)
+        .class(theme::Button::Text)
+        .padding([4, 6]);
+
+        let actions_row = row![copy_btn, clear_btn].spacing(4);
+
+        let header = row![
+            tabs_row,
+            space::horizontal().width(Length::Fill),
+            actions_row
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        // 2. Undo Notification Banner (discreet inline banner)
+        let maybe_undo_banner: Option<Element<_>> = if let Some((tab, _)) = &self.undo_cache {
+            if *tab == self.active_tab {
+                Some(
+                    container(
+                        row![
+                            text::caption(fl!("banner-cleared")),
+                            space::horizontal().width(Length::Fill),
+                            button::text(fl!("action-undo"))
+                                .on_press(Message::UndoClear)
+                                .class(theme::Button::Suggested)
+                                .padding([2, 8]),
+                        ]
+                        .align_y(Alignment::Center)
+                        .width(Length::Fill),
+                    )
+                    .padding([4, 8])
+                    .class(theme::Container::Card)
+                    .into(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 3. Text Editor
+        let editor = text_editor::text_editor(&self.contents[self.active_tab])
+            .placeholder(fl!("placeholder"))
+            .height(Length::Fill)
+            .padding(10)
+            .on_action(Message::EditorAction);
+
+        let editor_container = container(editor)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(theme::Container::Card);
+
+        // 4. Footer: Word & Character Counter (Left), Save Status (Right)
+        let current_text = self.current_text(self.active_tab);
+        let (words, chars) = ui::count_words_and_chars(&current_text);
+
+        let counter_label = text::caption(fl!("status-count", words = words, chars = chars));
+
+        let status_label = if self.saved_status[self.active_tab] {
+            text::caption(format!("● {}", fl!("status-saved")))
+        } else {
+            text::caption(format!("● {}", fl!("status-editing"))).class(theme::Text::Accent)
+        };
+
+        let footer = row![
+            counter_label,
+            space::horizontal().width(Length::Fill),
+            status_label
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        // Assemble Popover Content
+        let mut content_elements = Vec::with_capacity(4);
+        content_elements.push(header.into());
+        if let Some(banner) = maybe_undo_banner {
+            content_elements.push(banner);
+        }
+        content_elements.push(editor_container.into());
+        content_elements.push(footer.into());
+
+        let popover_col = column::with_children(content_elements)
+            .spacing(spacing.space_xs)
+            .width(Length::Fixed(POPUP_WIDTH))
+            .height(Length::Fixed(POPUP_HEIGHT));
+
+        padded_control(popover_col).into()
+    }
+}

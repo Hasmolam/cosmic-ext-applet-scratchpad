@@ -4,6 +4,8 @@ Minimalist quick notes and scratchpad applet for the COSMIC Desktop environment.
 
 Provides immediate access to three separate scratchpads directly from the COSMIC panel.
 
+![COSMIC Scratchpad Applet](screenshots/screenshot_main.png)
+
 ## Features
 
 - **Multi-Tab Workspace:** Three distinct pads (Notes, Snippets, Scratch) for temporary thoughts, shell commands, or draft text.

@@ -8,8 +8,17 @@ description = "Minimalist quick notes and scratchpad applet for the COSMIC Deskt
 authors = ["Hasan Hüseyin Yolcu <hasanhuseyinyolcu25@gmail.com>"]
 
 [dependencies]
-# COSMIC Applet UI (bundles tokio and cosmic-config)
-libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["applet"] }
+# COSMIC Applet UI (with multi-window, wayland, and applet token support)
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "dbus-config",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "desktop-systemd-scope",
+    "winit",
+] }
 
 # Serialization for configuration & preferences
 serde = { version = "1.0", features = ["derive"] }

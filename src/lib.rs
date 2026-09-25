@@ -6,11 +6,9 @@ pub mod storage;
 pub mod ui;
 
 use config::{ScratchpadConfig, load_config};
-use cosmic::applet::padded_control;
 use cosmic::cosmic_config::CosmicConfigEntry;
-use cosmic::iced::platform_specific::shell::wayland::commands::popup::destroy_popup;
 use cosmic::iced::widget::{column, row};
-use cosmic::iced::{Alignment, Length, Subscription, window};
+use cosmic::iced::{Alignment, Length, Limits, Subscription, window};
 use cosmic::widget::text_editor::{Action, Content};
 use cosmic::widget::{button, container, icon, space, text, text_editor};
 use cosmic::{Element, app, theme};
@@ -40,6 +38,7 @@ pub enum Message {
     ClearNote,
     UndoClear,
     DismissUndoBanner,
+    Surface(cosmic::surface::Action<Message>),
 }
 
 pub struct ScratchpadApp {
@@ -120,9 +119,12 @@ impl cosmic::Application for ScratchpadApp {
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
         match message {
             Message::TogglePopup => {
+                tracing::info!("TogglePopup invoked, current popup={:?}", self.popup);
                 if let Some(p) = self.popup.take() {
                     self.save_current_pad_if_dirty(self.active_tab);
-                    return destroy_popup(p);
+                    return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
+                        p,
+                    ));
                 }
 
                 cosmic::surface::surface_task(cosmic::surface::action::app_popup(
@@ -131,25 +133,33 @@ impl cosmic::Application for ScratchpadApp {
                         let new_id = window::Id::unique();
                         app.popup.replace(new_id);
 
-                        app.core.applet.get_popup_settings(
-                            app.core.main_window_id().unwrap(),
+                        let mut popup_settings = app.core.applet.get_popup_settings(
+                            app.core.main_window_id().unwrap_or(window::Id::RESERVED),
                             new_id,
+                            Some((POPUP_WIDTH as u32, POPUP_HEIGHT as u32)),
                             None,
                             None,
-                            None,
-                        )
+                        );
+                        popup_settings.positioner.size_limits = Limits::NONE
+                            .min_width(POPUP_WIDTH)
+                            .max_width(POPUP_WIDTH)
+                            .min_height(POPUP_HEIGHT)
+                            .max_height(POPUP_HEIGHT);
+                        popup_settings
                     },
                     None,
                 ))
             }
 
             Message::CloseRequested(id) => {
-                if Some(id) == self.popup {
+                if self.popup == Some(id) {
                     self.save_current_pad_if_dirty(self.active_tab);
                     self.popup = None;
                 }
                 app::Task::none()
             }
+
+            Message::Surface(a) => cosmic::task::message(cosmic::Action::Surface(a)),
 
             Message::SelectTab(index) => {
                 if index < storage::TOTAL_PADS && index != self.active_tab {
@@ -255,140 +265,145 @@ impl cosmic::Application for ScratchpadApp {
             .into()
     }
 
-    fn view_window(&self, _id: window::Id) -> Element<'_, Self::Message> {
-        let cosmic_theme = theme::active();
-        let spacing = cosmic_theme.cosmic().spacing;
+    fn view_window(&self, id: window::Id) -> Element<'_, Self::Message> {
+        if matches!(self.popup, Some(p) if p == id) {
+            let cosmic_theme = theme::active();
+            let spacing = cosmic_theme.cosmic().spacing;
 
-        // 1. Header: Pill Tabs (Left) and Quick Action Buttons (Right)
-        let tab_names = [fl!("tab-notes"), fl!("tab-snippets"), fl!("tab-scratch")];
+            // 1. Header: Pill Tabs (Left) and Quick Action Buttons (Right)
+            let tab_names = [fl!("tab-notes"), fl!("tab-snippets"), fl!("tab-scratch")];
 
-        let mut tab_buttons = Vec::with_capacity(storage::TOTAL_PADS);
-        for (i, name) in tab_names.into_iter().enumerate() {
-            let is_selected = i == self.active_tab;
-            let btn = button::text(name)
-                .on_press(Message::SelectTab(i))
-                .class(if is_selected {
+            let mut tab_buttons = Vec::with_capacity(storage::TOTAL_PADS);
+            for (i, name) in tab_names.into_iter().enumerate() {
+                let is_selected = i == self.active_tab;
+                let btn = button::text(name)
+                    .on_press(Message::SelectTab(i))
+                    .class(if is_selected {
+                        theme::Button::Suggested
+                    } else {
+                        theme::Button::Text
+                    })
+                    .padding([4, 10]);
+                tab_buttons.push(btn.into());
+            }
+
+            let tabs_row = row::with_children(tab_buttons).spacing(4);
+
+            let copy_icon = if self.copied_recently {
+                icon::from_name("emblem-ok-symbolic")
+                    .size(16)
+                    .symbolic(true)
+            } else {
+                icon::from_name("edit-copy-symbolic")
+                    .size(16)
+                    .symbolic(true)
+            };
+
+            let copy_btn = button::custom(copy_icon)
+                .on_press(Message::CopyAll)
+                .class(if self.copied_recently {
                     theme::Button::Suggested
                 } else {
                     theme::Button::Text
                 })
-                .padding([4, 10]);
-            tab_buttons.push(btn.into());
-        }
+                .padding([4, 6]);
 
-        let tabs_row = row::with_children(tab_buttons).spacing(4);
-
-        let copy_icon = if self.copied_recently {
-            icon::from_name("emblem-ok-symbolic")
-                .size(16)
-                .symbolic(true)
-        } else {
-            icon::from_name("edit-copy-symbolic")
-                .size(16)
-                .symbolic(true)
-        };
-
-        let copy_btn = button::custom(copy_icon)
-            .on_press(Message::CopyAll)
-            .class(if self.copied_recently {
-                theme::Button::Suggested
-            } else {
-                theme::Button::Text
-            })
+            let clear_btn = button::custom(
+                icon::from_name("edit-clear-symbolic")
+                    .size(16)
+                    .symbolic(true),
+            )
+            .on_press(Message::ClearNote)
+            .class(theme::Button::Text)
             .padding([4, 6]);
 
-        let clear_btn = button::custom(
-            icon::from_name("edit-clear-symbolic")
-                .size(16)
-                .symbolic(true),
-        )
-        .on_press(Message::ClearNote)
-        .class(theme::Button::Text)
-        .padding([4, 6]);
+            let actions_row = row![copy_btn, clear_btn].spacing(4);
 
-        let actions_row = row![copy_btn, clear_btn].spacing(4);
+            let header = row![
+                tabs_row,
+                space::horizontal().width(Length::Fill),
+                actions_row
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
 
-        let header = row![
-            tabs_row,
-            space::horizontal().width(Length::Fill),
-            actions_row
-        ]
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-
-        // 2. Undo Notification Banner (discreet inline banner)
-        let maybe_undo_banner: Option<Element<_>> = if let Some((tab, _)) = &self.undo_cache {
-            if *tab == self.active_tab {
-                Some(
-                    container(
-                        row![
-                            text::caption(fl!("banner-cleared")),
-                            space::horizontal().width(Length::Fill),
-                            button::text(fl!("action-undo"))
-                                .on_press(Message::UndoClear)
-                                .class(theme::Button::Suggested)
-                                .padding([2, 8]),
-                        ]
-                        .align_y(Alignment::Center)
-                        .width(Length::Fill),
+            // 2. Undo Notification Banner (discreet inline banner)
+            let maybe_undo_banner: Option<Element<_>> = if let Some((tab, _)) = &self.undo_cache {
+                if *tab == self.active_tab {
+                    Some(
+                        container(
+                            row![
+                                text::caption(fl!("banner-cleared")),
+                                space::horizontal().width(Length::Fill),
+                                button::text(fl!("action-undo"))
+                                    .on_press(Message::UndoClear)
+                                    .class(theme::Button::Suggested)
+                                    .padding([2, 8]),
+                            ]
+                            .align_y(Alignment::Center)
+                            .width(Length::Fill),
+                        )
+                        .padding([4, 8])
+                        .class(theme::Container::Card)
+                        .into(),
                     )
-                    .padding([4, 8])
-                    .class(theme::Container::Card)
-                    .into(),
-                )
+                } else {
+                    None
+                }
             } else {
                 None
+            };
+
+            // 3. Text Editor
+            let editor = text_editor::text_editor(&self.contents[self.active_tab])
+                .placeholder(fl!("placeholder"))
+                .height(Length::Fill)
+                .padding(10)
+                .on_action(Message::EditorAction);
+
+            let editor_container = container(editor)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .class(theme::Container::Card);
+
+            // 4. Footer: Word & Character Counter (Left), Save Status (Right)
+            let current_text = self.current_text(self.active_tab);
+            let (words, chars) = ui::count_words_and_chars(&current_text);
+
+            let counter_label = text::caption(fl!("status-count", words = words, chars = chars));
+
+            let status_label = if self.saved_status[self.active_tab] {
+                text::caption(format!("● {}", fl!("status-saved")))
+            } else {
+                text::caption(format!("● {}", fl!("status-editing"))).class(theme::Text::Accent)
+            };
+
+            let footer = row![
+                counter_label,
+                space::horizontal().width(Length::Fill),
+                status_label
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+
+            // Assemble Popover Content
+            let mut content_elements = Vec::with_capacity(4);
+            content_elements.push(header.into());
+            if let Some(banner) = maybe_undo_banner {
+                content_elements.push(banner);
             }
+            content_elements.push(editor_container.into());
+            content_elements.push(footer.into());
+
+            let popover_col = column::with_children(content_elements)
+                .spacing(spacing.space_xs)
+                .padding([8, 12])
+                .width(Length::Fixed(POPUP_WIDTH))
+                .height(Length::Fixed(POPUP_HEIGHT));
+
+            self.core.applet.popup_container(popover_col).into()
         } else {
-            None
-        };
-
-        // 3. Text Editor
-        let editor = text_editor::text_editor(&self.contents[self.active_tab])
-            .placeholder(fl!("placeholder"))
-            .height(Length::Fill)
-            .padding(10)
-            .on_action(Message::EditorAction);
-
-        let editor_container = container(editor)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .class(theme::Container::Card);
-
-        // 4. Footer: Word & Character Counter (Left), Save Status (Right)
-        let current_text = self.current_text(self.active_tab);
-        let (words, chars) = ui::count_words_and_chars(&current_text);
-
-        let counter_label = text::caption(fl!("status-count", words = words, chars = chars));
-
-        let status_label = if self.saved_status[self.active_tab] {
-            text::caption(format!("● {}", fl!("status-saved")))
-        } else {
-            text::caption(format!("● {}", fl!("status-editing"))).class(theme::Text::Accent)
-        };
-
-        let footer = row![
-            counter_label,
-            space::horizontal().width(Length::Fill),
-            status_label
-        ]
-        .align_y(Alignment::Center)
-        .width(Length::Fill);
-
-        // Assemble Popover Content
-        let mut content_elements = Vec::with_capacity(4);
-        content_elements.push(header.into());
-        if let Some(banner) = maybe_undo_banner {
-            content_elements.push(banner);
+            cosmic::widget::text("").into()
         }
-        content_elements.push(editor_container.into());
-        content_elements.push(footer.into());
-
-        let popover_col = column::with_children(content_elements)
-            .spacing(spacing.space_xs)
-            .width(Length::Fixed(POPUP_WIDTH))
-            .height(Length::Fixed(POPUP_HEIGHT));
-
-        padded_control(popover_col).into()
     }
 }

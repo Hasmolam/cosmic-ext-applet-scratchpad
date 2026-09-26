@@ -34,6 +34,7 @@ pub enum Message {
     SelectTab(usize),
     EditorAction(Action),
     DebounceTimeout(usize),
+    PadSaved(usize, Option<SystemTime>),
     CopyAll,
     ResetCopyStatus(u64),
     ClearNote,
@@ -79,6 +80,41 @@ impl ScratchpadApp {
                 self.last_edit_time[index] = None;
                 self.last_mtimes[index] = storage::get_pad_mtime(index);
             }
+        }
+    }
+
+    fn save_pad_async(&mut self, index: usize) -> app::Task<Message> {
+        if !self.saved_status[index] {
+            let text = self.current_text(index);
+            self.saved_status[index] = true;
+            self.last_edit_time[index] = None;
+            app::Task::future(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    storage::save_pad_atomic(index, &text).map(|()| storage::get_pad_mtime(index))
+                })
+                .await;
+                match res {
+                    Ok(Ok(mtime)) => cosmic::Action::App(Message::PadSaved(index, mtime)),
+                    Ok(Err(err)) => {
+                        tracing::error!(?err, index, "Failed to save pad atomically in background");
+                        cosmic::Action::App(Message::PadSaved(index, None))
+                    }
+                    Err(err) => {
+                        tracing::error!(?err, index, "Failed to join save task");
+                        cosmic::Action::App(Message::PadSaved(index, None))
+                    }
+                }
+            })
+        } else {
+            app::Task::none()
+        }
+    }
+
+    fn persist_config(&self) {
+        if let Some(handler) = &self.config_handler
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            tracing::warn!(?err, "Could not persist scratchpad config");
         }
     }
 }
@@ -142,22 +178,23 @@ impl cosmic::Application for ScratchpadApp {
             Message::TogglePopup => {
                 tracing::info!("TogglePopup invoked, current popup={:?}", self.popup);
                 if let Some(p) = self.popup.take() {
-                    self.save_current_pad_if_dirty(self.active_tab);
-                    return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
-                        p,
-                    ));
+                    let save_task = self.save_pad_async(self.active_tab);
+                    self.persist_config();
+                    let destroy_task =
+                        cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(p));
+                    return app::Task::batch([save_task, destroy_task]);
                 }
 
-                // If opening, check for external disk edits on the active tab
-                if self.saved_status[self.active_tab]
-                    && let Ok(Some((reloaded, new_mtime))) = storage::load_pad_if_modified(
-                        self.active_tab,
-                        self.last_mtimes[self.active_tab],
-                    )
-                {
-                    self.word_char_counts[self.active_tab] = ui::count_words_and_chars(&reloaded);
-                    self.contents[self.active_tab] = Content::with_text(&reloaded);
-                    self.last_mtimes[self.active_tab] = Some(new_mtime);
+                // If opening, check for external disk edits on all tabs
+                for tab in 0..storage::TOTAL_PADS {
+                    if self.saved_status[tab]
+                        && let Ok(Some((reloaded, new_mtime))) =
+                            storage::load_pad_if_modified(tab, self.last_mtimes[tab])
+                    {
+                        self.word_char_counts[tab] = ui::count_words_and_chars(&reloaded);
+                        self.contents[tab] = Content::with_text(&reloaded);
+                        self.last_mtimes[tab] = Some(new_mtime);
+                    }
                 }
 
                 cosmic::surface::surface_task(cosmic::surface::action::app_popup(
@@ -186,8 +223,10 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::CloseRequested(id) => {
                 if self.popup == Some(id) {
-                    self.save_current_pad_if_dirty(self.active_tab);
+                    let save_task = self.save_pad_async(self.active_tab);
+                    self.persist_config();
                     self.popup = None;
+                    return save_task;
                 }
                 app::Task::none()
             }
@@ -196,25 +235,18 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::SelectTab(index) => {
                 if index < storage::TOTAL_PADS && index != self.active_tab {
-                    self.save_current_pad_if_dirty(self.active_tab);
+                    let prev_tab = self.active_tab;
                     self.active_tab = index;
                     self.config.active_tab = index;
+                    // Zero-lag in-memory tab switch: save previous pad asynchronously in background
+                    return self.save_pad_async(prev_tab);
+                }
+                app::Task::none()
+            }
 
-                    // Check for external disk edits on the newly selected tab
-                    if self.saved_status[index]
-                        && let Ok(Some((reloaded, new_mtime))) =
-                            storage::load_pad_if_modified(index, self.last_mtimes[index])
-                    {
-                        self.word_char_counts[index] = ui::count_words_and_chars(&reloaded);
-                        self.contents[index] = Content::with_text(&reloaded);
-                        self.last_mtimes[index] = Some(new_mtime);
-                    }
-
-                    if let Some(handler) = &self.config_handler
-                        && let Err(err) = self.config.write_entry(handler)
-                    {
-                        tracing::warn!(?err, "Could not persist active_tab config");
-                    }
+            Message::PadSaved(tab, maybe_mtime) => {
+                if let Some(mtime) = maybe_mtime {
+                    self.last_mtimes[tab] = Some(mtime);
                 }
                 app::Task::none()
             }
@@ -243,7 +275,7 @@ impl cosmic::Application for ScratchpadApp {
                 if let Some(last_time) = self.last_edit_time[tab]
                     && last_time.elapsed() >= Duration::from_millis(DEBOUNCE_MILLIS - 50)
                 {
-                    self.save_current_pad_if_dirty(tab);
+                    return self.save_pad_async(tab);
                 }
                 app::Task::none()
             }
@@ -318,11 +350,7 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::ToggleWrapLines => {
                 self.config.wrap_lines = !self.config.wrap_lines;
-                if let Some(handler) = &self.config_handler
-                    && let Err(err) = self.config.write_entry(handler)
-                {
-                    tracing::warn!(?err, "Could not persist wrap_lines config");
-                }
+                self.persist_config();
                 app::Task::none()
             }
 
@@ -330,21 +358,18 @@ impl cosmic::Application for ScratchpadApp {
                 let new_size = (self.config.font_size + delta).clamp(10.0, 24.0);
                 if (new_size - self.config.font_size).abs() > f32::EPSILON {
                     self.config.font_size = new_size;
-                    if let Some(handler) = &self.config_handler
-                        && let Err(err) = self.config.write_entry(handler)
-                    {
-                        tracing::warn!(?err, "Could not persist font_size config");
-                    }
+                    self.persist_config();
                 }
                 app::Task::none()
             }
 
             Message::EscapePressed => {
                 if let Some(p) = self.popup.take() {
-                    self.save_current_pad_if_dirty(self.active_tab);
-                    return cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(
-                        p,
-                    ));
+                    let save_task = self.save_pad_async(self.active_tab);
+                    self.persist_config();
+                    let destroy_task =
+                        cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(p));
+                    return app::Task::batch([save_task, destroy_task]);
                 }
                 app::Task::none()
             }

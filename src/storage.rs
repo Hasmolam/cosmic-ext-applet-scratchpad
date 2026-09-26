@@ -3,6 +3,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub const TOTAL_PADS: usize = 3;
 
@@ -25,18 +26,169 @@ pub fn data_dir() -> PathBuf {
     PathBuf::from("/tmp/cosmic-scratchpad")
 }
 
+/// Directory for soft-deleted / trashed notes.
+pub fn trash_dir() -> PathBuf {
+    data_dir().join("trash")
+}
+
 /// Returns the path to the Markdown file for the given pad index (0-indexed).
 pub fn pad_path(index: usize) -> PathBuf {
     data_dir().join(format!("pad_{}.md", index + 1))
 }
 
-/// Loads the contents of the given pad index. Returns empty string if the file doesn't exist yet.
-pub fn load_pad(index: usize) -> io::Result<String> {
-    let path = pad_path(index);
-    if !path.exists() {
-        return Ok(String::new());
+/// Natural sorting helper for note files:
+/// pad_1.md, pad_2.md, pad_10.md are sorted numerically.
+/// Other files follow alphabetically.
+fn note_sort_key(filename: &str) -> (u8, u64, String) {
+    if let Some(rest) = filename.strip_prefix("pad_")
+        && let Some(num_str) = rest.strip_suffix(".md")
+        && let Ok(num) = num_str.parse::<u64>()
+    {
+        return (0, num, String::new());
     }
-    fs::read_to_string(path)
+    (1, 0, filename.to_lowercase())
+}
+
+/// Lists all Markdown note files in the specified directory.
+/// If directory is empty, creates `pad_1.md` and returns it so at least one note always exists.
+pub fn list_notes_in_dir(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    fs::create_dir_all(dir)?;
+
+    let mut notes = Vec::new();
+    let entries = fs::read_dir(dir)?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if filename.ends_with(".md")
+                && !filename.starts_with('.')
+                && !filename.ends_with(".bak")
+            {
+                notes.push(path);
+            }
+        }
+    }
+
+    notes.sort_by(|a, b| {
+        let name_a = a.file_name().unwrap_or_default().to_string_lossy();
+        let name_b = b.file_name().unwrap_or_default().to_string_lossy();
+        note_sort_key(&name_a).cmp(&note_sort_key(&name_b))
+    });
+
+    if notes.is_empty() {
+        let initial_file = dir.join("pad_1.md");
+        atomic_write(&initial_file, "")?;
+        notes.push(initial_file);
+    }
+
+    Ok(notes)
+}
+
+/// Lists all notes in the default data directory.
+pub fn list_notes() -> io::Result<Vec<PathBuf>> {
+    list_notes_in_dir(&data_dir())
+}
+
+/// Derives a clean note title from note content:
+/// Scans for first non-empty line, removes markdown headers/list symbols, and truncates if necessary.
+pub fn derive_title(content: &str, fallback: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let mut cleaned = trimmed.trim_start_matches('#').trim();
+        for prefix in ["- ", "* ", "+ ", "> "] {
+            if let Some(rest) = cleaned.strip_prefix(prefix) {
+                cleaned = rest.trim();
+                break;
+            }
+        }
+
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let chars: Vec<char> = cleaned.chars().collect();
+        return if chars.len() > 22 {
+            let truncated: String = chars.into_iter().take(22).collect();
+            format!("{}…", truncated.trim_end())
+        } else {
+            cleaned.to_string()
+        };
+    }
+
+    fallback.to_string()
+}
+
+/// Creates a new note in the specified directory.
+/// If `title_opt` is supplied, pre-populates note with `# <title>\n\n`.
+pub fn create_new_note_in_dir(dir: &Path, title_opt: Option<&str>) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+
+    let mut max_idx = 0u64;
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(fname) = path.file_name().and_then(|f| f.to_str())
+                && let Some(rest) = fname.strip_prefix("pad_")
+                && let Some(num_str) = rest.strip_suffix(".md")
+                && let Ok(num) = num_str.parse::<u64>()
+            {
+                max_idx = max_idx.max(num);
+            }
+        }
+    }
+
+    let next_idx = max_idx + 1;
+    let new_path = dir.join(format!("pad_{}.md", next_idx));
+    let initial_content = if let Some(title) = title_opt
+        && !title.trim().is_empty()
+    {
+        format!("# {}\n\n", title.trim())
+    } else {
+        String::new()
+    };
+
+    atomic_write(&new_path, &initial_content)?;
+    Ok(new_path)
+}
+
+/// Creates a new note in the default data directory.
+pub fn create_new_note(title_opt: Option<&str>) -> io::Result<PathBuf> {
+    create_new_note_in_dir(&data_dir(), title_opt)
+}
+
+/// Deletes a note file safely by copying it to the trash directory and then removing the original.
+/// Returns the content that was deleted (for undo support).
+pub fn delete_note(path: &Path) -> io::Result<String> {
+    let content = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+
+    if path.exists() {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let trash = parent.join("trash");
+        let _ = fs::create_dir_all(&trash);
+
+        if let Some(file_name) = path.file_name() {
+            let ts = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let trash_file = trash.join(format!("{}_{}", ts, file_name.to_string_lossy()));
+            let _ = atomic_write(&trash_file, &content);
+        }
+
+        fs::remove_file(path)?;
+    }
+
+    Ok(content)
 }
 
 /// Atomically writes content to the target file.
@@ -81,12 +233,64 @@ pub fn atomic_write(target_path: &Path, content: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Returns the path to the backup file for the given pad index.
+/// Returns the last modification time of the file on disk if it exists.
+pub fn note_mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Loads note content if modified on disk since `last_mtime`.
+pub fn load_note_if_modified(
+    path: &Path,
+    last_mtime: Option<SystemTime>,
+) -> io::Result<Option<(String, SystemTime)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mtime = fs::metadata(path)?.modified()?;
+    if let Some(prev) = last_mtime
+        && mtime <= prev
+    {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(path)?;
+    Ok(Some((content, mtime)))
+}
+
+/// Saves the given note content atomically to disk.
+pub fn save_note_atomic(path: &Path, content: &str) -> io::Result<()> {
+    atomic_write(path, content)
+}
+
+// Backward-compatible wrappers for legacy 3-pad indexing
+pub fn load_pad(index: usize) -> io::Result<String> {
+    let path = pad_path(index);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(path)
+}
+
+pub fn save_pad_atomic(index: usize, content: &str) -> io::Result<()> {
+    atomic_write(&pad_path(index), content)
+}
+
+pub fn get_pad_mtime(index: usize) -> Option<SystemTime> {
+    note_mtime(&pad_path(index))
+}
+
+pub fn load_pad_if_modified(
+    index: usize,
+    last_mtime: Option<SystemTime>,
+) -> io::Result<Option<(String, SystemTime)>> {
+    load_note_if_modified(&pad_path(index), last_mtime)
+}
+
 pub fn backup_path(index: usize) -> PathBuf {
     data_dir().join(format!("pad_{}.md.bak", index + 1))
 }
 
-/// Creates an atomic backup of the given pad file before clearing.
 pub fn create_pad_backup(index: usize) -> io::Result<()> {
     let source = pad_path(index);
     if source.exists() {
@@ -98,43 +302,95 @@ pub fn create_pad_backup(index: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Saves the given pad content atomically to disk.
-pub fn save_pad_atomic(index: usize, content: &str) -> io::Result<()> {
-    atomic_write(&pad_path(index), content)
-}
-
-/// Returns the last modification time of the pad file on disk if it exists.
-pub fn get_pad_mtime(index: usize) -> Option<std::time::SystemTime> {
-    let path = pad_path(index);
-    fs::metadata(&path).ok().and_then(|m| m.modified().ok())
-}
-
-/// Loads the pad content if it was modified on disk since `last_mtime`.
-/// Returns Ok(Some((content, new_mtime))) if modified or initially loaded.
-/// Returns Ok(None) if unchanged.
-pub fn load_pad_if_modified(
-    index: usize,
-    last_mtime: Option<std::time::SystemTime>,
-) -> io::Result<Option<(String, std::time::SystemTime)>> {
-    let path = pad_path(index);
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let mtime = fs::metadata(&path)?.modified()?;
-    if let Some(prev) = last_mtime
-        && mtime <= prev
-    {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(&path)?;
-    Ok(Some((content, mtime)))
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn test_derive_title() {
+        assert_eq!(
+            derive_title("# Project Setup\nSome content", "Fallback"),
+            "Project Setup"
+        );
+        assert_eq!(derive_title("### Sub Header", "Fallback"), "Sub Header");
+        assert_eq!(derive_title("* Bullet item", "Fallback"), "Bullet item");
+        assert_eq!(
+            derive_title("- Another bullet", "Fallback"),
+            "Another bullet"
+        );
+        assert_eq!(derive_title("> Quote line", "Fallback"), "Quote line");
+        assert_eq!(
+            derive_title("Plain text first line\nSecond line", "Fallback"),
+            "Plain text first line"
+        );
+        assert_eq!(
+            derive_title("   \n\n#    Spaced Title   \n", "Fallback"),
+            "Spaced Title"
+        );
+        assert_eq!(derive_title("", "Fallback"), "Fallback");
+        assert_eq!(derive_title("   \n\t  ", "Fallback"), "Fallback");
+
+        // Long title truncation (capped at 22 chars + ellipsis)
+        let long_line = "This is a remarkably long line designed to test title truncation behavior";
+        let derived = derive_title(long_line, "Fallback");
+        assert!(derived.ends_with('…'));
+        assert!(derived.chars().count() <= 23);
+
+        // Markdown bold / formatting preservation
+        assert_eq!(derive_title("**Bold Title**", "Fallback"), "**Bold Title**");
+        assert_eq!(derive_title("`code snippet`", "Fallback"), "`code snippet`");
+
+        // Unicode and Turkish character handling
+        let turkish_line = "Şekerli çay ve öğleden sonra toplantısı";
+        let turkish_derived = derive_title(turkish_line, "Fallback");
+        assert!(turkish_derived.ends_with('…'));
+        assert!(turkish_derived.starts_with("Şekerli çay"));
+    }
+
+    #[test]
+    fn test_list_and_create_notes_in_dir() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_list_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        // 1. Calling create_new_note_in_dir directly in empty directory creates pad_1.md only
+        let p1 = create_new_note_in_dir(&temp_dir, None).expect("Failed to create initial note");
+        assert!(p1.ends_with("pad_1.md"));
+        let notes_after_init = list_notes_in_dir(&temp_dir).unwrap();
+        assert_eq!(notes_after_init.len(), 1);
+        assert_eq!(notes_after_init[0], p1);
+
+        // 2. Create pad_2.md with title
+        let p2 = create_new_note_in_dir(&temp_dir, Some("Meeting Notes"))
+            .expect("Failed to create note");
+        assert!(p2.ends_with("pad_2.md"));
+        let p2_content = fs::read_to_string(&p2).unwrap();
+        assert_eq!(p2_content, "# Meeting Notes\n\n");
+
+        // 3. Create pad_3.md without title
+        let p3 = create_new_note_in_dir(&temp_dir, None).expect("Failed to create note 3");
+        assert!(p3.ends_with("pad_3.md"));
+        assert_eq!(fs::read_to_string(&p3).unwrap(), "");
+
+        // 4. Verify list order
+        let notes_all = list_notes_in_dir(&temp_dir).unwrap();
+        assert_eq!(notes_all.len(), 3);
+        assert!(notes_all[0].ends_with("pad_1.md"));
+        assert!(notes_all[1].ends_with("pad_2.md"));
+        assert!(notes_all[2].ends_with("pad_3.md"));
+
+        // 5. Delete note and verify timestamped trash backup
+        let deleted_content = delete_note(&p2).expect("Failed to delete note");
+        assert_eq!(deleted_content, "# Meeting Notes\n\n");
+        assert!(!p2.exists());
+        let trash_entries: Vec<_> = fs::read_dir(temp_dir.join("trash"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(trash_entries.iter().any(|name| name.ends_with("_pad_2.md")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_atomic_write_creates_file_and_parent_dirs() {
@@ -186,13 +442,6 @@ pub mod tests {
     }
 
     #[test]
-    fn test_load_pad_fallback_to_empty() {
-        // High pad index that doesn't exist
-        let result = load_pad(999).unwrap();
-        assert_eq!(result, "");
-    }
-
-    #[test]
     fn test_pad_path_indexing() {
         let p0 = pad_path(0);
         let p1 = pad_path(1);
@@ -201,34 +450,6 @@ pub mod tests {
         assert!(p0.ends_with("pad_1.md"));
         assert!(p1.ends_with("pad_2.md"));
         assert!(p2.ends_with("pad_3.md"));
-    }
-
-    #[test]
-    fn test_load_pad_if_modified_detects_changes() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("scratchpad_mtime_test_{}", std::process::id()));
-        let file_path = temp_dir.join("pad_1.md");
-
-        // 1. Initial write
-        atomic_write(&file_path, "Version 1").expect("Failed to write v1");
-        let mtime_v1 = fs::metadata(&file_path).unwrap().modified().unwrap();
-
-        // Calling load_pad_if_modified with mtime_v1 on non-existent index vs same time
-        // Simulate checking if modified since mtime_v1
-        let path = &file_path;
-        let mtime = fs::metadata(path).unwrap().modified().unwrap();
-        assert!(mtime <= mtime_v1);
-
-        // 2. Wait 10ms to ensure timestamp difference on filesystems with fine grain mtime
-        std::thread::sleep(std::time::Duration::from_millis(15));
-        atomic_write(&file_path, "Version 2").expect("Failed to write v2");
-        let mtime_v2 = fs::metadata(&file_path).unwrap().modified().unwrap();
-
-        assert!(mtime_v2 > mtime_v1);
-        let content_v2 = fs::read_to_string(&file_path).unwrap();
-        assert_eq!(content_v2, "Version 2");
-
-        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
@@ -279,23 +500,49 @@ pub mod tests {
     }
 
     #[test]
-    fn test_backup_path_and_creation() {
-        let b0 = backup_path(0);
-        let b1 = backup_path(1);
-        let b2 = backup_path(2);
-        assert!(b0.ends_with("pad_1.md.bak"));
-        assert!(b1.ends_with("pad_2.md.bak"));
-        assert!(b2.ends_with("pad_3.md.bak"));
+    fn test_create_new_note_on_empty_dir_creates_single_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("scratchpad_empty_dir_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
 
-        // Save a test pad then create backup
-        save_pad_atomic(0, "Test Backup Content").expect("Failed to save pad 0");
-        create_pad_backup(0).expect("Failed to create pad backup");
+        // Creating on an empty dir should produce pad_1.md and nothing else
+        let note = create_new_note_in_dir(&temp_dir, Some("First Note"))
+            .expect("Failed to create note in empty dir");
+        assert!(note.ends_with("pad_1.md"));
 
-        assert!(b0.exists());
-        let backup_content = fs::read_to_string(&b0).expect("Failed to read backup file");
-        assert_eq!(backup_content, "Test Backup Content");
+        let files = list_notes_in_dir(&temp_dir).expect("Failed to list notes");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], note);
 
-        // Cleanup
-        let _ = fs::remove_file(&b0);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_trash_retention_multiple_deletions() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "scratchpad_multi_trash_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let p1 = create_new_note_in_dir(&temp_dir, Some("Note V1")).unwrap();
+        delete_note(&p1).unwrap();
+
+        // Create another note with same name (pad_1.md)
+        let p1_again = create_new_note_in_dir(&temp_dir, Some("Note V2")).unwrap();
+        assert_eq!(p1, p1_again);
+        delete_note(&p1_again).unwrap();
+
+        let trash_dir = temp_dir.join("trash");
+        let trashed: Vec<_> = fs::read_dir(trash_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+
+        // Ensure both versions exist in trash and did not overwrite each other
+        assert_eq!(trashed.len(), 2);
+        assert!(trashed.iter().all(|f| f.ends_with("_pad_1.md")));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

@@ -112,8 +112,8 @@ pub fn derive_title(content: &str, fallback: &str) -> String {
         }
 
         let chars: Vec<char> = cleaned.chars().collect();
-        return if chars.len() > 22 {
-            let truncated: String = chars.into_iter().take(22).collect();
+        return if chars.len() > 16 {
+            let truncated: String = chars.into_iter().take(16).collect();
             format!("{}…", truncated.trim_end())
         } else {
             cleaned.to_string()
@@ -320,8 +320,8 @@ pub mod tests {
         );
         assert_eq!(derive_title("> Quote line", "Fallback"), "Quote line");
         assert_eq!(
-            derive_title("Plain text first line\nSecond line", "Fallback"),
-            "Plain text first line"
+            derive_title("Plain text line\nSecond line", "Fallback"),
+            "Plain text line"
         );
         assert_eq!(
             derive_title("   \n\n#    Spaced Title   \n", "Fallback"),
@@ -330,11 +330,11 @@ pub mod tests {
         assert_eq!(derive_title("", "Fallback"), "Fallback");
         assert_eq!(derive_title("   \n\t  ", "Fallback"), "Fallback");
 
-        // Long title truncation (capped at 22 chars + ellipsis)
+        // Long title truncation (capped at 16 chars + ellipsis)
         let long_line = "This is a remarkably long line designed to test title truncation behavior";
         let derived = derive_title(long_line, "Fallback");
         assert!(derived.ends_with('…'));
-        assert!(derived.chars().count() <= 23);
+        assert!(derived.chars().count() <= 17);
 
         // Markdown bold / formatting preservation
         assert_eq!(derive_title("**Bold Title**", "Fallback"), "**Bold Title**");

@@ -856,7 +856,8 @@ impl cosmic::Application for ScratchpadApp {
             let title_btn = button::text(note_counter_title)
                 .on_press(Message::ToggleSearch)
                 .class(theme::Button::Text)
-                .padding([4, 8]);
+                .padding([4, 8])
+                .width(Length::Fixed(140.0));
 
             let title_with_tooltip = tooltip(
                 title_btn,

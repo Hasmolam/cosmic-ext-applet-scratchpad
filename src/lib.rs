@@ -7,7 +7,10 @@ pub mod ui;
 
 use config::{ScratchpadConfig, load_config};
 use cosmic::cosmic_config::CosmicConfigEntry;
-use cosmic::iced::core::keyboard::{Key, key::Named};
+use cosmic::iced::core::keyboard::{
+    Key,
+    key::{Named, Physical},
+};
 use cosmic::iced::widget::{column, row};
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window};
 use cosmic::widget::text_editor::{Action, Content};
@@ -16,8 +19,14 @@ use cosmic::widget::{
 };
 use cosmic::{Element, app, theme};
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
+
+static ALTGR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 pub const APP_ID: &str = "io.github.hasmolam.cosmic-ext-applet-scratchpad";
 const POPUP_WIDTH: f32 = 380.0;
@@ -64,6 +73,7 @@ pub enum Message {
     ToggleWrapLines,
     AdjustFontSize(f32),
     EscapePressed,
+    AltGrSearchInput(Physical, bool, Option<char>),
     Surface(cosmic::surface::Action<Message>),
 }
 
@@ -82,6 +92,7 @@ pub struct ScratchpadApp {
     is_searching: bool,
     search_query: String,
     filtered_indices: Vec<usize>,
+    altgr_map: Arc<ui::AltGrMap>,
 }
 
 impl ScratchpadApp {
@@ -241,6 +252,7 @@ impl cosmic::Application for ScratchpadApp {
             is_searching: false,
             search_query: String::new(),
             filtered_indices,
+            altgr_map: Arc::new(ui::AltGrMap::load_system()),
         };
 
         (app, app::Task::none())
@@ -254,6 +266,7 @@ impl cosmic::Application for ScratchpadApp {
         match message {
             Message::TogglePopup => {
                 tracing::info!("TogglePopup invoked, current popup={:?}", self.popup);
+                ALTGR_ACTIVE.store(false, Ordering::SeqCst);
                 if let Some(p) = self.popup.take() {
                     let save_task = self.save_note_async(self.active_index);
                     self.persist_config();
@@ -261,6 +274,8 @@ impl cosmic::Application for ScratchpadApp {
                         cosmic::surface::surface_task(cosmic::surface::action::destroy_popup(p));
                     return app::Task::batch([save_task, destroy_task]);
                 }
+
+                self.altgr_map = Arc::new(ui::AltGrMap::load_system());
 
                 // If opening, check for external disk edits on all notes
                 for (i, note) in self.notes.iter_mut().enumerate() {
@@ -303,6 +318,7 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::CloseRequested(id) => {
                 if self.popup == Some(id) {
+                    ALTGR_ACTIVE.store(false, Ordering::SeqCst);
                     let save_task = self.save_note_async(self.active_index);
                     self.persist_config();
                     self.popup = None;
@@ -630,6 +646,7 @@ impl cosmic::Application for ScratchpadApp {
             }
 
             Message::EscapePressed => {
+                ALTGR_ACTIVE.store(false, Ordering::SeqCst);
                 if self.is_searching {
                     self.is_searching = false;
                     self.search_query.clear();
@@ -645,15 +662,51 @@ impl cosmic::Application for ScratchpadApp {
                 }
                 app::Task::none()
             }
+
+            Message::AltGrSearchInput(physical, shift, text_ch) => {
+                if self.is_searching
+                    && let Some((normal_ch, altgr_ch)) = self.altgr_map.resolve(physical, shift)
+                    && text_ch != Some(altgr_ch)
+                {
+                    if let Some(norm) = normal_ch
+                        && self.search_query.ends_with(norm)
+                    {
+                        self.search_query.pop();
+                    }
+                    self.search_query.push(altgr_ch);
+                    self.update_search_filter();
+                }
+                app::Task::none()
+            }
         }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
         if self.popup.is_some() {
-            cosmic::iced::keyboard::listen().filter_map(|event| {
-                if let cosmic::iced::core::keyboard::Event::KeyPressed { key, modifiers, .. } =
-                    event
-                {
+            cosmic::iced::keyboard::listen().filter_map(|event| match event {
+                cosmic::iced::core::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    physical_key,
+                    text,
+                    ..
+                } => {
+                    if ui::is_altgr_key(&key, physical_key) {
+                        ALTGR_ACTIVE.store(true, Ordering::SeqCst);
+                        return None;
+                    }
+                    let altgr_held = (ALTGR_ACTIVE.load(Ordering::SeqCst)
+                        && !modifiers.control()
+                        && !modifiers.logo())
+                        || (modifiers.control() && modifiers.alt() && !modifiers.logo());
+                    if altgr_held {
+                        let text_ch = text.as_deref().and_then(|s| s.chars().next());
+                        return Some(Message::AltGrSearchInput(
+                            physical_key,
+                            modifiers.shift(),
+                            text_ch,
+                        ));
+                    }
                     if key
                         == cosmic::iced::core::keyboard::Key::Named(
                             cosmic::iced::core::keyboard::key::Named::Escape,
@@ -661,6 +714,7 @@ impl cosmic::Application for ScratchpadApp {
                     {
                         Some(Message::EscapePressed)
                     } else if modifiers.command()
+                        && !modifiers.alt()
                         && (key.as_ref() == Key::Character("f")
                             || key.as_ref() == Key::Character("F")
                             || key.as_ref() == Key::Character("k")
@@ -668,21 +722,25 @@ impl cosmic::Application for ScratchpadApp {
                     {
                         Some(Message::ToggleSearch)
                     } else if modifiers.command()
+                        && !modifiers.alt()
                         && (key.as_ref() == Key::Character("n")
                             || key.as_ref() == Key::Character("N"))
                     {
                         Some(Message::NewNote(None))
                     } else if modifiers.command()
+                        && !modifiers.alt()
                         && (key.as_ref() == Key::Character("[")
                             || key == Key::Named(Named::ArrowLeft))
                     {
                         Some(Message::PrevNote)
                     } else if modifiers.command()
+                        && !modifiers.alt()
                         && (key.as_ref() == Key::Character("]")
                             || key == Key::Named(Named::ArrowRight))
                     {
                         Some(Message::NextNote)
                     } else if modifiers.command()
+                        && !modifiers.alt()
                         && modifiers.shift()
                         && (key.as_ref() == cosmic::iced::core::keyboard::Key::Character("c")
                             || key.as_ref() == cosmic::iced::core::keyboard::Key::Character("C"))
@@ -691,9 +749,16 @@ impl cosmic::Application for ScratchpadApp {
                     } else {
                         None
                     }
-                } else {
+                }
+                cosmic::iced::core::keyboard::Event::KeyReleased {
+                    key, physical_key, ..
+                } => {
+                    if ui::is_altgr_key(&key, physical_key) {
+                        ALTGR_ACTIVE.store(false, Ordering::SeqCst);
+                    }
                     None
                 }
+                _ => None,
             })
         } else {
             Subscription::none()
@@ -1067,6 +1132,7 @@ impl cosmic::Application for ScratchpadApp {
             };
 
             // 4. Text Editor with Font Size & Line Wrapping
+            let altgr_map = Arc::clone(&self.altgr_map);
             let editor = text_editor::text_editor(&self.notes[self.active_index].content)
                 .placeholder(fl!("placeholder"))
                 .size(self.config.font_size)
@@ -1075,10 +1141,28 @@ impl cosmic::Application for ScratchpadApp {
                 } else {
                     cosmic::iced::core::text::Wrapping::None
                 })
-                .key_binding(|keypress| {
+                .key_binding(move |keypress| {
+                    if ui::is_altgr_key(&keypress.key, keypress.physical_key) {
+                        ALTGR_ACTIVE.store(true, Ordering::SeqCst);
+                        return None;
+                    }
+                    let altgr_held = (ALTGR_ACTIVE.load(Ordering::SeqCst)
+                        && !keypress.modifiers.control()
+                        && !keypress.modifiers.logo())
+                        || (keypress.modifiers.control()
+                            && keypress.modifiers.alt()
+                            && !keypress.modifiers.logo());
+                    if altgr_held
+                        && let Some((_, altgr_ch)) =
+                            altgr_map.resolve(keypress.physical_key, keypress.modifiers.shift())
+                    {
+                        return Some(text_editor::Binding::Insert(altgr_ch));
+                    }
+
                     if keypress.key == Key::Named(Named::Escape) {
                         Some(text_editor::Binding::Custom(Message::EscapePressed))
                     } else if keypress.modifiers.command()
+                        && !keypress.modifiers.alt()
                         && (keypress.key.as_ref() == Key::Character("f")
                             || keypress.key.as_ref() == Key::Character("F")
                             || keypress.key.as_ref() == Key::Character("k")
@@ -1086,21 +1170,25 @@ impl cosmic::Application for ScratchpadApp {
                     {
                         Some(text_editor::Binding::Custom(Message::ToggleSearch))
                     } else if keypress.modifiers.command()
+                        && !keypress.modifiers.alt()
                         && (keypress.key.as_ref() == Key::Character("n")
                             || keypress.key.as_ref() == Key::Character("N"))
                     {
                         Some(text_editor::Binding::Custom(Message::NewNote(None)))
                     } else if keypress.modifiers.command()
+                        && !keypress.modifiers.alt()
                         && (keypress.key.as_ref() == Key::Character("[")
                             || keypress.key == Key::Named(Named::ArrowLeft))
                     {
                         Some(text_editor::Binding::Custom(Message::PrevNote))
                     } else if keypress.modifiers.command()
+                        && !keypress.modifiers.alt()
                         && (keypress.key.as_ref() == Key::Character("]")
                             || keypress.key == Key::Named(Named::ArrowRight))
                     {
                         Some(text_editor::Binding::Custom(Message::NextNote))
                     } else if keypress.modifiers.command()
+                        && !keypress.modifiers.alt()
                         && keypress.modifiers.shift()
                         && (keypress.key.as_ref() == Key::Character("c")
                             || keypress.key.as_ref() == Key::Character("C"))

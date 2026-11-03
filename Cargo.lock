@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-ext-applet-scratchpad"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "i18n-embed 0.15.4",
  "i18n-embed-fl",
@@ -1005,6 +1005,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xkbcommon 0.8.0",
 ]
 
 [[package]]

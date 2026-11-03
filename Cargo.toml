@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-ext-applet-scratchpad"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.93"
 license = "GPL-3.0-only"
@@ -35,6 +35,9 @@ rust-embed = "8.5"
 
 # Async runtime primitives
 tokio = { version = "1", features = ["time", "macros", "rt"] }
+
+# XKB layout resolution for AltGr (Level3/Level4) symbol input
+xkbcommon = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

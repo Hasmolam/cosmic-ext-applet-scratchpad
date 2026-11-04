@@ -1,32 +1,58 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use cosmic::cctk::wayland_client::{
+    Connection, Dispatch, QueueHandle, WEnum,
+    protocol::{wl_keyboard, wl_registry, wl_seat},
+};
 use cosmic::iced::core::keyboard::{
     Key,
-    key::{Code, Named, Physical},
+    key::{Code, Named, NativeCode, Physical},
 };
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use xkbcommon::xkb;
 
 /// Returns true if the key event corresponds to AltGr (`ISO_Level3_Shift` / Right Alt).
+///
+/// Note: `libcosmic`'s Wayland backend calls `raw_keycode_to_physicalkey(ke.raw_code)` which
+/// subtracts 8 from the evdev scancode (`100 - 8 = 92 => Code::Convert` for `AltRight`).
 pub fn is_altgr_key(key: &Key, physical: Physical) -> bool {
-    matches!(key, Key::Named(Named::AltGraph)) || matches!(physical, Physical::Code(Code::AltRight))
+    matches!(key, Key::Named(Named::AltGraph))
+        || matches!(physical, Physical::Code(Code::Convert | Code::AltRight))
 }
 
-/// Precomputed lookup table mapping `(Physical KeyCode, shift)` to `(normal_char, altgr_char)`
-/// for the user's active XKB keyboard layout.
+/// Precomputed lookup table for the user's active XKB keyboard layout.
 ///
-/// Workaround for `cosmic-panel` resetting `ISO_Level3_Shift` (`Mod5`) in `wl_keyboard::modifiers`,
-/// which otherwise causes `AltGr + key` combinations to emit unmodified Level 1/2 characters.
+/// Workaround for two upstream issues in COSMIC applets:
+/// 1. `cosmic-panel` resets `ISO_Level3_Shift` (`Mod5`) in `wl_keyboard::modifiers`, causing
+///    `AltGr + key` combinations to emit unmodified Level 1/2 characters.
+/// 2. `libcosmic`'s `sctk_event.rs` passes evdev `raw_code` (without `+ 8`) to
+///    `raw_keycode_to_physicalkey`, which calls `saturating_sub(8)`. As a result, evdev
+///    scancodes `2..=8` (`Digit1..=Digit7`) all report `Physical::Unidentified(Xkb(0))` and
+///    scancodes `>= 9` report the `Physical::Code` of `scancode - 8`.
 #[derive(Debug, Clone, Default)]
 pub struct AltGrMap {
-    entries: HashMap<(Code, bool), (Option<char>, char)>,
+    /// Maps `(evdev_scancode, shift)` -> `(normal_char, altgr_char)` for all keys.
+    by_scancode: HashMap<(u32, bool), (Option<char>, char)>,
+    /// Maps `(normal_char, shift)` -> `(Option<char>, char)` for `Digit1..=Digit7` (evdev `2..=8`),
+    /// where `libcosmic` collapses `physical_key` to `Unidentified(Xkb(0))`.
+    low_scancodes_by_char: HashMap<(char, bool), (Option<char>, char)>,
+    /// Fallback mapping `(normal_char, shift)` -> `(Option<char>, char)` across all keys.
+    by_char: HashMap<(char, bool), (Option<char>, char)>,
 }
 
 impl AltGrMap {
-    /// Loads the active XKB configuration from COSMIC (`com.system76.CosmicComp`),
-    /// environment variables, or system keyboard config files.
+    /// Loads the active XKB keymap directly from the Wayland compositor (`wl_keyboard::keymap`),
+    /// falling back to COSMIC (`com.system76.CosmicComp`), environment variables, or system files.
     pub fn load_system() -> Self {
+        if let Some((keymap, active_group)) = fetch_wayland_keymap() {
+            let map = Self::from_keymap(&keymap, active_group);
+            if !map.by_scancode.is_empty() {
+                return map;
+            }
+        }
+
         let rmlvo = detect_system_rmlvo();
         Self::from_rmlvo(
             &rmlvo.rules,
@@ -60,14 +86,26 @@ impl AltGrMap {
         });
 
         match keymap {
-            Some(km) => Self::from_keymap(&km),
+            Some(km) => Self::from_keymap(&km, 0),
             None => Self::default(),
         }
     }
 
-    fn from_keymap(keymap: &xkb::Keymap) -> Self {
-        let mut entries = HashMap::new();
+    fn from_keymap(keymap: &xkb::Keymap, preferred_group: u32) -> Self {
+        let mut by_scancode = HashMap::new();
+        let mut low_scancodes_by_char = HashMap::new();
+        let mut by_char = HashMap::new();
         let num_groups = keymap.num_layouts().max(1);
+
+        let mut group_order = Vec::with_capacity(num_groups as usize);
+        if preferred_group < num_groups {
+            group_order.push(preferred_group);
+        }
+        for g in 0..num_groups {
+            if g != preferred_group {
+                group_order.push(g);
+            }
+        }
 
         let shift_idx = keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
         let shift_bit = if shift_idx != xkb::MOD_INVALID {
@@ -84,12 +122,12 @@ impl AltGrMap {
             }
         }
 
-        for &(code, scancode) in MAPPED_KEYS {
+        for &scancode in MAPPED_EVDEV_SCANCODES {
             let xkb_keycode = xkb::Keycode::new(scancode + 8);
             for shift in [false, true] {
                 let active_shift = if shift { shift_bit } else { 0 };
 
-                for group in 0..num_groups {
+                for &group in &group_order {
                     let mut normal_state = xkb::State::new(keymap);
                     normal_state.update_mask(active_shift, 0, 0, 0, 0, group);
                     let normal_char = extract_xkb_char(&normal_state, xkb_keycode);
@@ -106,23 +144,185 @@ impl AltGrMap {
                     if let Some(ch) = altgr_char
                         && Some(ch) != normal_char
                     {
-                        entries.insert((code, shift), (normal_char, ch));
+                        by_scancode.insert((scancode, shift), (normal_char, ch));
+                        if let Some(norm) = normal_char {
+                            if (2..=8).contains(&scancode) {
+                                low_scancodes_by_char.insert((norm, shift), (normal_char, ch));
+                            }
+                            by_char.entry((norm, shift)).or_insert((normal_char, ch));
+                        }
                         break;
                     }
                 }
             }
         }
 
-        Self { entries }
-    }
-
-    /// Resolves `(normal_char, altgr_char)` for a physical key and Shift state.
-    pub fn resolve(&self, physical: Physical, shift: bool) -> Option<(Option<char>, char)> {
-        match physical {
-            Physical::Code(code) => self.entries.get(&(code, shift)).copied(),
-            Physical::Unidentified(_) => None,
+        Self {
+            by_scancode,
+            low_scancodes_by_char,
+            by_char,
         }
     }
+
+    /// Resolves `(normal_char, altgr_char)` for a Wayland key press in `libcosmic`.
+    pub fn resolve_key(
+        &self,
+        key: &Key,
+        physical: Physical,
+        shift: bool,
+    ) -> Option<(Option<char>, char)> {
+        let key_char = match key.as_ref() {
+            Key::Character(s) => s.chars().next(),
+            _ => None,
+        };
+
+        // 1. If `physical` carries a non-zero scancode (evdev scancode >= 9, shifted by -8 in libcosmic)
+        if let Some(evdev_scancode) = wayland_physical_to_evdev_scancode(physical) {
+            if let Some(&(normal_ch, altgr_ch)) = self.by_scancode.get(&(evdev_scancode, shift))
+                && (chars_match_ci(key_char, normal_ch)
+                    || key_char.is_none()
+                    || key_char == Some(altgr_ch))
+            {
+                return Some((normal_ch, altgr_ch));
+            }
+            // Fallback in case a future libcosmic update removes the -8 scancode offset
+            if let Some(unshifted) = unshifted_code_to_evdev_scancode(physical)
+                && let Some(&(normal_ch, altgr_ch)) = self.by_scancode.get(&(unshifted, shift))
+                && (chars_match_ci(key_char, normal_ch) || key_char == Some(altgr_ch))
+            {
+                return Some((normal_ch, altgr_ch));
+            }
+            return None;
+        }
+
+        // 2. For evdev scancodes 2..=8 (Digit1..=Digit7), libcosmic reports Unidentified(Xkb(0))
+        if let Some(ch) = key_char {
+            if let Some(&res) = self.low_scancodes_by_char.get(&(ch, shift)) {
+                return Some(res);
+            }
+            let lower = ch.to_lowercase().next().unwrap_or(ch);
+            if let Some(&res) = self.low_scancodes_by_char.get(&(lower, shift)) {
+                return Some(res);
+            }
+            if let Some(&res) = self.by_char.get(&(ch, shift)) {
+                return Some(res);
+            }
+        }
+
+        None
+    }
+
+    /// Resolves `(normal_char, altgr_char)` directly by unshifted `Code` (for unit tests).
+    pub fn resolve(&self, physical: Physical, shift: bool) -> Option<(Option<char>, char)> {
+        let scancode = unshifted_code_to_evdev_scancode(physical)?;
+        self.by_scancode.get(&(scancode, shift)).copied()
+    }
+}
+
+fn chars_match_ci(a: Option<char>, b: Option<char>) -> bool {
+    match (a, b) {
+        (Some(ca), Some(cb)) => ca == cb || ca.to_lowercase().eq(cb.to_lowercase()),
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct WaylandKeymapState {
+    keymap_string: Option<String>,
+    active_group: u32,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for WaylandKeymapState {
+    fn event(
+        _state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+            && interface == "wl_seat"
+        {
+            let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version.min(5), qh, ());
+            let _keyboard = seat.get_keyboard(qh, ());
+        }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for WaylandKeymapState {
+    fn event(
+        _state: &mut Self,
+        _seat: &wl_seat::WlSeat,
+        _event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandKeymapState {
+    fn event(
+        state: &mut Self,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_keyboard::Event::Keymap {
+                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                fd,
+                size,
+            } => {
+                let mut file = std::fs::File::from(fd);
+                let len = size.saturating_sub(1) as usize;
+                let mut buf = vec![0u8; len];
+                if file.read_exact(&mut buf).is_ok() {
+                    if let Some(nul_pos) = buf.iter().position(|&b| b == 0) {
+                        buf.truncate(nul_pos);
+                    }
+                    if let Ok(s) = String::from_utf8(buf) {
+                        state.keymap_string = Some(s);
+                    }
+                }
+            }
+            wl_keyboard::Event::Modifiers { group, .. } => {
+                state.active_group = group;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn fetch_wayland_keymap() -> Option<(xkb::Keymap, u32)> {
+    let conn = Connection::connect_to_env().ok()?;
+    let display = conn.display();
+    let mut event_queue = conn.new_event_queue::<WaylandKeymapState>();
+    let qh = event_queue.handle();
+    let _registry = display.get_registry(&qh, ());
+
+    let mut state = WaylandKeymapState::default();
+    event_queue.roundtrip(&mut state).ok()?;
+    if state.keymap_string.is_none() {
+        event_queue.roundtrip(&mut state).ok()?;
+    }
+
+    let keymap_str = state.keymap_string?;
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap = xkb::Keymap::new_from_string(
+        &context,
+        keymap_str,
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::COMPILE_NO_FLAGS,
+    )?;
+    Some((keymap, state.active_group))
 }
 
 fn extract_xkb_char(state: &xkb::State, keycode: xkb::Keycode) -> Option<char> {
@@ -272,59 +472,151 @@ fn unquote_ron_str(s: &str) -> String {
     s.trim().trim_matches('"').to_string()
 }
 
-const MAPPED_KEYS: &[(Code, u32)] = &[
-    (Code::Digit1, 2),
-    (Code::Digit2, 3),
-    (Code::Digit3, 4),
-    (Code::Digit4, 5),
-    (Code::Digit5, 6),
-    (Code::Digit6, 7),
-    (Code::Digit7, 8),
-    (Code::Digit8, 9),
-    (Code::Digit9, 10),
-    (Code::Digit0, 11),
-    (Code::Minus, 12),
-    (Code::Equal, 13),
-    (Code::KeyQ, 16),
-    (Code::KeyW, 17),
-    (Code::KeyE, 18),
-    (Code::KeyR, 19),
-    (Code::KeyT, 20),
-    (Code::KeyY, 21),
-    (Code::KeyU, 22),
-    (Code::KeyI, 23),
-    (Code::KeyO, 24),
-    (Code::KeyP, 25),
-    (Code::BracketLeft, 26),
-    (Code::BracketRight, 27),
-    (Code::KeyA, 30),
-    (Code::KeyS, 31),
-    (Code::KeyD, 32),
-    (Code::KeyF, 33),
-    (Code::KeyG, 34),
-    (Code::KeyH, 35),
-    (Code::KeyJ, 36),
-    (Code::KeyK, 37),
-    (Code::KeyL, 38),
-    (Code::Semicolon, 39),
-    (Code::Quote, 40),
-    (Code::Backquote, 41),
-    (Code::Backslash, 43),
-    (Code::KeyZ, 44),
-    (Code::KeyX, 45),
-    (Code::KeyC, 46),
-    (Code::KeyV, 47),
-    (Code::KeyB, 48),
-    (Code::KeyN, 49),
-    (Code::KeyM, 50),
-    (Code::Comma, 51),
-    (Code::Period, 52),
-    (Code::Slash, 53),
-    (Code::Space, 57),
-    (Code::IntlBackslash, 86),
-    (Code::IntlRo, 89),
-    (Code::IntlYen, 124),
+const MAPPED_EVDEV_SCANCODES: &[u32] = &[
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 57, 86, 89,
+    124,
 ];
+
+/// Converts `libcosmic` Wayland's `Physical` key (which went through `raw_code.saturating_sub(8)`)
+/// back to the original Linux evdev scancode (`raw_code = shifted + 8`).
+fn wayland_physical_to_evdev_scancode(physical: Physical) -> Option<u32> {
+    let shifted = unshifted_code_to_evdev_scancode(physical)?;
+    (shifted > 0).then_some(shifted + 8)
+}
+
+/// Exact inverse of `scancode_to_physicalkey` in `libcosmic/iced/winit/.../wayland/keymap.rs`.
+fn unshifted_code_to_evdev_scancode(physical: Physical) -> Option<u32> {
+    let code = match physical {
+        Physical::Code(code) => code,
+        Physical::Unidentified(NativeCode::Xkb(raw)) => return (raw > 0).then_some(raw),
+        _ => return None,
+    };
+    let scancode = match code {
+        Code::Escape => 1,
+        Code::Digit1 => 2,
+        Code::Digit2 => 3,
+        Code::Digit3 => 4,
+        Code::Digit4 => 5,
+        Code::Digit5 => 6,
+        Code::Digit6 => 7,
+        Code::Digit7 => 8,
+        Code::Digit8 => 9,
+        Code::Digit9 => 10,
+        Code::Digit0 => 11,
+        Code::Minus => 12,
+        Code::Equal => 13,
+        Code::Backspace => 14,
+        Code::Tab => 15,
+        Code::KeyQ => 16,
+        Code::KeyW => 17,
+        Code::KeyE => 18,
+        Code::KeyR => 19,
+        Code::KeyT => 20,
+        Code::KeyY => 21,
+        Code::KeyU => 22,
+        Code::KeyI => 23,
+        Code::KeyO => 24,
+        Code::KeyP => 25,
+        Code::BracketLeft => 26,
+        Code::BracketRight => 27,
+        Code::Enter => 28,
+        Code::ControlLeft => 29,
+        Code::KeyA => 30,
+        Code::KeyS => 31,
+        Code::KeyD => 32,
+        Code::KeyF => 33,
+        Code::KeyG => 34,
+        Code::KeyH => 35,
+        Code::KeyJ => 36,
+        Code::KeyK => 37,
+        Code::KeyL => 38,
+        Code::Semicolon => 39,
+        Code::Quote => 40,
+        Code::Backquote => 41,
+        Code::ShiftLeft => 42,
+        Code::Backslash => 43,
+        Code::KeyZ => 44,
+        Code::KeyX => 45,
+        Code::KeyC => 46,
+        Code::KeyV => 47,
+        Code::KeyB => 48,
+        Code::KeyN => 49,
+        Code::KeyM => 50,
+        Code::Comma => 51,
+        Code::Period => 52,
+        Code::Slash => 53,
+        Code::ShiftRight => 54,
+        Code::NumpadMultiply => 55,
+        Code::AltLeft => 56,
+        Code::Space => 57,
+        Code::CapsLock => 58,
+        Code::F1 => 59,
+        Code::F2 => 60,
+        Code::F3 => 61,
+        Code::F4 => 62,
+        Code::F5 => 63,
+        Code::F6 => 64,
+        Code::F7 => 65,
+        Code::F8 => 66,
+        Code::F9 => 67,
+        Code::F10 => 68,
+        Code::NumLock => 69,
+        Code::ScrollLock => 70,
+        Code::Numpad7 => 71,
+        Code::Numpad8 => 72,
+        Code::Numpad9 => 73,
+        Code::NumpadSubtract => 74,
+        Code::Numpad4 => 75,
+        Code::Numpad5 => 76,
+        Code::Numpad6 => 77,
+        Code::NumpadAdd => 78,
+        Code::Numpad1 => 79,
+        Code::Numpad2 => 80,
+        Code::Numpad3 => 81,
+        Code::Numpad0 => 82,
+        Code::NumpadDecimal => 83,
+        Code::Lang5 => 85,
+        Code::IntlBackslash => 86,
+        Code::F11 => 87,
+        Code::F12 => 88,
+        Code::IntlRo => 89,
+        Code::Lang3 => 90,
+        Code::Lang4 => 91,
+        Code::Convert => 92,
+        Code::KanaMode => 93,
+        Code::NonConvert => 94,
+        Code::NumpadEnter => 96,
+        Code::ControlRight => 97,
+        Code::NumpadDivide => 98,
+        Code::PrintScreen => 99,
+        Code::AltRight => 100,
+        Code::Home => 102,
+        Code::ArrowUp => 103,
+        Code::PageUp => 104,
+        Code::ArrowLeft => 105,
+        Code::ArrowRight => 106,
+        Code::End => 107,
+        Code::ArrowDown => 108,
+        Code::PageDown => 109,
+        Code::Insert => 110,
+        Code::Delete => 111,
+        Code::AudioVolumeMute => 113,
+        Code::AudioVolumeDown => 114,
+        Code::AudioVolumeUp => 115,
+        Code::NumpadEqual => 117,
+        Code::Pause => 119,
+        Code::NumpadComma => 121,
+        Code::Lang1 => 122,
+        Code::Lang2 => 123,
+        Code::IntlYen => 124,
+        Code::SuperLeft => 125,
+        Code::SuperRight => 126,
+        Code::ContextMenu => 127,
+        _ => return None,
+    };
+    Some(scancode)
+}
 
 /// Calculates word and character count for any UTF-8 text string.
 pub fn count_words_and_chars(text: &str) -> (usize, usize) {
@@ -514,5 +806,213 @@ pub mod tests {
             parsed.options.as_deref(),
             Some("lv3:ralt_switch,compose:rctrl")
         );
+    }
+
+    #[test]
+    fn test_resolve_key_with_libcosmic_wayland_shifted_scancodes() {
+        use cosmic::iced::core::keyboard::key::NativeCode;
+
+        let es_map = AltGrMap::from_rmlvo("", "", "es", "", Some("lv3:ralt_switch"));
+        let unidentified_zero = Physical::Unidentified(NativeCode::Xkb(0));
+
+        // In libcosmic Wayland, Digit2 (evdev 3) and Digit3 (evdev 4) saturate to Xkb(0)
+        assert_eq!(
+            es_map.resolve_key(&Key::Character("2".into()), unidentified_zero, false),
+            Some((Some('2'), '@'))
+        );
+        assert_eq!(
+            es_map.resolve_key(&Key::Character("3".into()), unidentified_zero, false),
+            Some((Some('3'), '#'))
+        );
+        assert_eq!(
+            es_map.resolve_key(&Key::Character("4".into()), unidentified_zero, false),
+            Some((Some('4'), '~'))
+        );
+
+        let tr_map = AltGrMap::from_rmlvo("", "", "tr", "", Some("lv3:ralt_switch"));
+        // Digit7 (evdev 8) -> 8 - 8 = 0 => Unidentified(Xkb(0))
+        assert_eq!(
+            tr_map.resolve_key(&Key::Character("7".into()), unidentified_zero, false),
+            Some((Some('7'), '{'))
+        );
+        // Digit8 (evdev 9) -> 9 - 8 = 1 => Code::Escape
+        assert_eq!(
+            tr_map.resolve_key(
+                &Key::Character("8".into()),
+                Physical::Code(Code::Escape),
+                false
+            ),
+            Some((Some('8'), '['))
+        );
+        // KeyQ (evdev 16) -> 16 - 8 = 8 => Code::Digit7
+        assert_eq!(
+            tr_map.resolve_key(
+                &Key::Character("q".into()),
+                Physical::Code(Code::Digit7),
+                false
+            ),
+            Some((Some('q'), '@'))
+        );
+
+        // Exhaustively verify every mapped scancode across es, tr, de, fr, se layouts
+        for layout in ["es", "tr", "de", "fr", "se"] {
+            let map = AltGrMap::from_rmlvo("", "", layout, "", None);
+            assert!(
+                !map.by_scancode.is_empty(),
+                "layout {layout} should not be empty"
+            );
+            for (&(evdev_scancode, shift), &(normal_ch, expected_altgr)) in &map.by_scancode {
+                let shifted = evdev_scancode.saturating_sub(8);
+                let wayland_physical = sim_libcosmic_scancode_to_physical(shifted);
+                let key = match normal_ch {
+                    Some(c) => Key::Character(c.to_string().into()),
+                    None => Key::Unidentified,
+                };
+                if shifted > 0 || normal_ch.is_some() {
+                    let resolved = map
+                        .resolve_key(&key, wayland_physical, shift)
+                        .map(|(_, ch)| ch);
+                    assert_eq!(
+                        resolved,
+                        Some(expected_altgr),
+                        "failed for layout={layout} evdev={evdev_scancode} shift={shift} normal={normal_ch:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn sim_libcosmic_scancode_to_physical(scancode: u32) -> Physical {
+        if scancode == 0 {
+            return Physical::Unidentified(NativeCode::Xkb(0));
+        }
+        for code in [
+            Code::Escape,
+            Code::Digit1,
+            Code::Digit2,
+            Code::Digit3,
+            Code::Digit4,
+            Code::Digit5,
+            Code::Digit6,
+            Code::Digit7,
+            Code::Digit8,
+            Code::Digit9,
+            Code::Digit0,
+            Code::Minus,
+            Code::Equal,
+            Code::Backspace,
+            Code::Tab,
+            Code::KeyQ,
+            Code::KeyW,
+            Code::KeyE,
+            Code::KeyR,
+            Code::KeyT,
+            Code::KeyY,
+            Code::KeyU,
+            Code::KeyI,
+            Code::KeyO,
+            Code::KeyP,
+            Code::BracketLeft,
+            Code::BracketRight,
+            Code::Enter,
+            Code::ControlLeft,
+            Code::KeyA,
+            Code::KeyS,
+            Code::KeyD,
+            Code::KeyF,
+            Code::KeyG,
+            Code::KeyH,
+            Code::KeyJ,
+            Code::KeyK,
+            Code::KeyL,
+            Code::Semicolon,
+            Code::Quote,
+            Code::Backquote,
+            Code::ShiftLeft,
+            Code::Backslash,
+            Code::KeyZ,
+            Code::KeyX,
+            Code::KeyC,
+            Code::KeyV,
+            Code::KeyB,
+            Code::KeyN,
+            Code::KeyM,
+            Code::Comma,
+            Code::Period,
+            Code::Slash,
+            Code::ShiftRight,
+            Code::NumpadMultiply,
+            Code::AltLeft,
+            Code::Space,
+            Code::CapsLock,
+            Code::F1,
+            Code::F2,
+            Code::F3,
+            Code::F4,
+            Code::F5,
+            Code::F6,
+            Code::F7,
+            Code::F8,
+            Code::F9,
+            Code::F10,
+            Code::NumLock,
+            Code::ScrollLock,
+            Code::Numpad7,
+            Code::Numpad8,
+            Code::Numpad9,
+            Code::NumpadSubtract,
+            Code::Numpad4,
+            Code::Numpad5,
+            Code::Numpad6,
+            Code::NumpadAdd,
+            Code::Numpad1,
+            Code::Numpad2,
+            Code::Numpad3,
+            Code::Numpad0,
+            Code::NumpadDecimal,
+            Code::Lang5,
+            Code::IntlBackslash,
+            Code::F11,
+            Code::F12,
+            Code::IntlRo,
+            Code::Lang3,
+            Code::Lang4,
+            Code::Convert,
+            Code::KanaMode,
+            Code::NonConvert,
+            Code::NumpadEnter,
+            Code::ControlRight,
+            Code::NumpadDivide,
+            Code::PrintScreen,
+            Code::AltRight,
+            Code::Home,
+            Code::ArrowUp,
+            Code::PageUp,
+            Code::ArrowLeft,
+            Code::ArrowRight,
+            Code::End,
+            Code::ArrowDown,
+            Code::PageDown,
+            Code::Insert,
+            Code::Delete,
+            Code::AudioVolumeMute,
+            Code::AudioVolumeDown,
+            Code::AudioVolumeUp,
+            Code::NumpadEqual,
+            Code::Pause,
+            Code::NumpadComma,
+            Code::Lang1,
+            Code::Lang2,
+            Code::IntlYen,
+            Code::SuperLeft,
+            Code::SuperRight,
+            Code::ContextMenu,
+        ] {
+            let phys = Physical::Code(code);
+            if unshifted_code_to_evdev_scancode(phys) == Some(scancode) {
+                return phys;
+            }
+        }
+        Physical::Unidentified(NativeCode::Xkb(scancode))
     }
 }

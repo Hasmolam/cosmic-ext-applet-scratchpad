@@ -73,7 +73,7 @@ pub enum Message {
     ToggleWrapLines,
     AdjustFontSize(f32),
     EscapePressed,
-    AltGrSearchInput(Physical, bool, Option<char>),
+    AltGrSearchInput(Key, Physical, bool, Option<char>),
     Surface(cosmic::surface::Action<Message>),
 }
 
@@ -663,9 +663,10 @@ impl cosmic::Application for ScratchpadApp {
                 app::Task::none()
             }
 
-            Message::AltGrSearchInput(physical, shift, text_ch) => {
+            Message::AltGrSearchInput(key, physical, shift, text_ch) => {
                 if self.is_searching
-                    && let Some((normal_ch, altgr_ch)) = self.altgr_map.resolve(physical, shift)
+                    && let Some((normal_ch, altgr_ch)) =
+                        self.altgr_map.resolve_key(&key, physical, shift)
                     && text_ch != Some(altgr_ch)
                 {
                     if let Some(norm) = normal_ch
@@ -702,6 +703,7 @@ impl cosmic::Application for ScratchpadApp {
                     if altgr_held {
                         let text_ch = text.as_deref().and_then(|s| s.chars().next());
                         return Some(Message::AltGrSearchInput(
+                            key,
                             physical_key,
                             modifiers.shift(),
                             text_ch,
@@ -1153,8 +1155,12 @@ impl cosmic::Application for ScratchpadApp {
                             && keypress.modifiers.alt()
                             && !keypress.modifiers.logo());
                     if altgr_held
-                        && let Some((_, altgr_ch)) =
-                            altgr_map.resolve(keypress.physical_key, keypress.modifiers.shift())
+                        && matches!(keypress.status, text_editor::Status::Focused { .. })
+                        && let Some((_, altgr_ch)) = altgr_map.resolve_key(
+                            &keypress.key,
+                            keypress.physical_key,
+                            keypress.modifiers.shift(),
+                        )
                     {
                         return Some(text_editor::Binding::Insert(altgr_ch));
                     }

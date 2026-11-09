@@ -7,32 +7,143 @@ pub mod ui;
 
 use config::{ScratchpadConfig, load_config};
 use cosmic::cosmic_config::CosmicConfigEntry;
+use cosmic::iced::core::SmolStr;
 use cosmic::iced::core::keyboard::{
-    Key,
+    Key, Modifiers,
     key::{Named, Physical},
 };
 use cosmic::iced::widget::{column, row};
 use cosmic::iced::{Alignment, Length, Limits, Subscription, window};
-use cosmic::widget::text_editor::{Action, Content};
+use cosmic::widget::text_editor::{Action, Binding, Content, Edit, KeyPress, Motion};
 use cosmic::widget::{
     button, container, icon, scrollable, space, text, text_editor, text_input, tooltip,
 };
-use cosmic::{Element, app, theme};
+use cosmic::{Application, Element, app, theme};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, SystemTime};
 use tokio::time::Instant;
 
 static ALTGR_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Ctrl/Shift/Alt/Super state tracked from key press and release events.
+///
+/// When cosmic-panel leaves keyboard focus on the panel-button surface, the
+/// `modifiers` field of key events delivered there goes stale: after Ctrl+F every
+/// later key still reports Ctrl as held, although the produced text is correct.
+/// Keys forwarded from that surface use this state instead.
+static HELD_MODIFIERS: AtomicU32 = AtomicU32::new(0);
+
+fn modifier_of(key: &Key) -> Option<Modifiers> {
+    match key {
+        Key::Named(Named::Control) => Some(Modifiers::CTRL),
+        Key::Named(Named::Shift) => Some(Modifiers::SHIFT),
+        Key::Named(Named::Alt) => Some(Modifiers::ALT),
+        Key::Named(Named::Super | Named::Meta) => Some(Modifiers::LOGO),
+        _ => None,
+    }
+}
+
+fn track_modifier(key: &Key, pressed: bool) {
+    if let Some(modifier) = modifier_of(key) {
+        if pressed {
+            HELD_MODIFIERS.fetch_or(modifier.bits(), Ordering::SeqCst);
+        } else {
+            HELD_MODIFIERS.fetch_and(!modifier.bits(), Ordering::SeqCst);
+        }
+    }
+}
+
+fn held_modifiers() -> Modifiers {
+    Modifiers::from_bits_truncate(HELD_MODIFIERS.load(Ordering::SeqCst))
+}
+
+/// Clears tracked key state; releases that happen while the popup is closed are
+/// not observed.
+fn reset_key_state() {
+    ALTGR_ACTIVE.store(false, Ordering::SeqCst);
+    HELD_MODIFIERS.store(0, Ordering::SeqCst);
+}
+
 pub const APP_ID: &str = "io.github.hasmolam.cosmic-ext-applet-scratchpad";
 const POPUP_WIDTH: f32 = 380.0;
 const POPUP_HEIGHT: f32 = 440.0;
 const DEBOUNCE_MILLIS: u64 = 400;
 const UNDO_BANNER_SECS: u64 = 5;
+
+const SEARCH_INPUT_ID: &str = "nv_search_input";
+
+fn focus_search_input() -> app::Task<Message> {
+    text_input::focus(cosmic::iced::core::widget::Id::new(SEARCH_INPUT_ID))
+}
+
+/// Builds editor content with the cursor at the end of the document, so freshly
+/// loaded notes accept appended text without a click.
+fn content_at_end(text: &str) -> Content {
+    let mut content = Content::with_text(text);
+    content.perform(Action::Move(Motion::DocumentEnd));
+    content
+}
+
+/// AltGr is tracked through `ALTGR_ACTIVE` because cosmic-panel drops the level-3
+/// modifier before keys reach the applet; Ctrl+Alt is the X11-style equivalent.
+fn altgr_held(modifiers: Modifiers) -> bool {
+    (ALTGR_ACTIVE.load(Ordering::SeqCst) && !modifiers.control() && !modifiers.logo())
+        || (modifiers.control() && modifiers.alt() && !modifiers.logo())
+}
+
+/// Application shortcuts, shared by the editor key binding and uncaptured keys.
+fn shortcut_message(key: &Key, modifiers: Modifiers) -> Option<Message> {
+    if *key == Key::Named(Named::Escape) {
+        return Some(Message::EscapePressed);
+    }
+    if !modifiers.command() || modifiers.alt() {
+        return None;
+    }
+    match key.as_ref() {
+        Key::Character("f" | "F" | "k" | "K") => Some(Message::ToggleSearch),
+        Key::Character("n" | "N") => Some(Message::NewNote(None)),
+        Key::Character("[") | Key::Named(Named::ArrowLeft) => Some(Message::PrevNote),
+        Key::Character("]") | Key::Named(Named::ArrowRight) => Some(Message::NextNote),
+        Key::Character("c" | "C") if modifiers.shift() => Some(Message::CopyAll),
+        _ => None,
+    }
+}
+
+/// Key binding for the note editor: AltGr symbols, app shortcuts, then the
+/// default text editor bindings.
+fn editor_binding(altgr_map: &ui::AltGrMap, keypress: KeyPress) -> Option<Binding<Message>> {
+    if ui::is_altgr_key(&keypress.key, keypress.physical_key) {
+        ALTGR_ACTIVE.store(true, Ordering::SeqCst);
+        return None;
+    }
+    if altgr_held(keypress.modifiers)
+        && let Some((_, altgr_ch)) = altgr_map.resolve_key(
+            &keypress.key,
+            keypress.physical_key,
+            keypress.modifiers.shift(),
+        )
+    {
+        return Some(Binding::Insert(altgr_ch));
+    }
+    if let Some(message) = shortcut_message(&keypress.key, keypress.modifiers) {
+        return Some(Binding::Custom(message));
+    }
+    Binding::from_key_press(keypress)
+}
+
+/// A key press that no widget captured, with the window it was delivered to.
+#[derive(Debug, Clone)]
+pub struct KeyInput {
+    key: Key,
+    modified_key: Key,
+    physical_key: Physical,
+    modifiers: Modifiers,
+    text: Option<SmolStr>,
+}
 
 pub fn run() -> cosmic::iced::Result {
     localize::localize();
@@ -73,8 +184,9 @@ pub enum Message {
     ToggleWrapLines,
     AdjustFontSize(f32),
     EscapePressed,
-    AltGrSearchInput(Key, Physical, bool, Option<char>),
+    KeyInput(window::Id, KeyInput),
     Surface(cosmic::surface::Action<Message>),
+    PopupFocusGained(window::Id),
 }
 
 pub struct ScratchpadApp {
@@ -93,6 +205,12 @@ pub struct ScratchpadApp {
     search_query: String,
     filtered_indices: Vec<usize>,
     altgr_map: Arc<ui::AltGrMap>,
+    /// Must be `Id::unique()`, not a named `Id::new(..)`. libcosmic's `TextEditor`
+    /// reports the inner editor's id from its context-menu wrapper as well, so a
+    /// named id appears twice in the widget tree. `Tree::take_all_named` then
+    /// overwrites one state with the other and the editor panics with
+    /// "Downcast on stateless state" on the next rebuild.
+    editor_id: cosmic::iced::core::widget::Id,
 }
 
 impl ScratchpadApp {
@@ -170,9 +288,171 @@ impl ScratchpadApp {
             self.is_searching = false;
             self.config.active_tab = target;
             self.config.active_file = Some(self.notes[target].filename.clone());
-            return self.save_note_async(prev_idx);
+            return app::Task::batch([self.save_note_async(prev_idx), self.focus_editor()]);
+        }
+        if self.is_searching {
+            self.is_searching = false;
+        }
+        self.focus_editor()
+    }
+
+    fn active_selection(&self) -> Option<String> {
+        self.notes
+            .get(self.active_index)
+            .and_then(|note| note.content.selection())
+    }
+
+    /// Applies an editor binding outside the widget, mirroring what
+    /// `TextEditor::update` does for a focused editor.
+    fn apply_binding(&mut self, binding: Binding<Message>) -> app::Task<Message> {
+        let action = match binding {
+            Binding::Unfocus => return app::Task::none(),
+            Binding::Copy => {
+                return self
+                    .active_selection()
+                    .map_or_else(app::Task::none, cosmic::iced::clipboard::write);
+            }
+            Binding::Cut => {
+                let Some(selection) = self.active_selection() else {
+                    return app::Task::none();
+                };
+                let delete = self.update(Message::EditorAction(Action::Edit(Edit::Delete)));
+                return app::Task::batch([cosmic::iced::clipboard::write(selection), delete]);
+            }
+            Binding::Paste => {
+                return cosmic::iced::clipboard::read().and_then(|text| {
+                    cosmic::task::message(cosmic::Action::App(Message::EditorAction(Action::Edit(
+                        Edit::Paste(Arc::new(text)),
+                    ))))
+                });
+            }
+            Binding::Move(motion) => Action::Move(motion),
+            Binding::Select(motion) => Action::Select(motion),
+            Binding::SelectWord => Action::SelectWord,
+            Binding::SelectLine => Action::SelectLine,
+            Binding::SelectAll => Action::SelectAll,
+            Binding::Insert(ch) => Action::Edit(Edit::Insert(ch)),
+            Binding::Enter => Action::Edit(Edit::Enter),
+            Binding::Backspace => Action::Edit(Edit::Backspace),
+            Binding::Delete => Action::Edit(Edit::Delete),
+            Binding::Sequence(bindings) => {
+                let mut tasks = Vec::with_capacity(bindings.len());
+                for binding in bindings {
+                    tasks.push(self.apply_binding(binding));
+                }
+                return app::Task::batch(tasks);
+            }
+            Binding::Custom(message) => return self.update(message),
+        };
+        self.update(Message::EditorAction(action))
+    }
+
+    /// Handles key presses that no widget captured while the popup is open.
+    ///
+    /// cosmic-panel hands keyboard focus back to the applet's panel-button surface
+    /// right after the popup maps, so keys typed immediately after opening arrive
+    /// on the main window rather than the popup, and Wayland gives the client no
+    /// way to take focus back. Those keys are applied to the editor or the search
+    /// query here, so typing works without clicking into the popup first. The same
+    /// path covers an unfocused editor inside the popup.
+    fn handle_uncaptured_key(
+        &mut self,
+        window: window::Id,
+        mut input: KeyInput,
+    ) -> app::Task<Message> {
+        let Some(popup) = self.popup else {
+            return app::Task::none();
+        };
+        let in_popup = window == popup;
+        if !in_popup {
+            input.modifiers = held_modifiers();
+        }
+
+        if self.is_searching {
+            return self.search_key(in_popup, input);
+        }
+
+        let keypress = KeyPress {
+            key: input.key,
+            modified_key: input.modified_key,
+            physical_key: input.physical_key,
+            modifiers: input.modifiers,
+            text: input.text,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        let Some(binding) = editor_binding(&self.altgr_map, keypress) else {
+            return app::Task::none();
+        };
+        let is_editing = !matches!(binding, Binding::Custom(_) | Binding::Unfocus);
+        let task = self.apply_binding(binding);
+        if in_popup && is_editing {
+            // The editor lost widget focus inside the popup (e.g. a button was
+            // clicked); give it back so the cursor is shown again.
+            app::Task::batch([task, self.focus_editor()])
+        } else {
+            task
+        }
+    }
+
+    fn search_key(&mut self, in_popup: bool, input: KeyInput) -> app::Task<Message> {
+        if altgr_held(input.modifiers)
+            && let Some((normal_ch, altgr_ch)) =
+                self.altgr_map
+                    .resolve_key(&input.key, input.physical_key, input.modifiers.shift())
+        {
+            if in_popup {
+                // The focused search input may already have inserted the
+                // level-1 character for this key; replace it.
+                let text_ch = input.text.as_deref().and_then(|s| s.chars().next());
+                if text_ch == Some(altgr_ch) {
+                    return app::Task::none();
+                }
+                if let Some(norm) = normal_ch
+                    && self.search_query.ends_with(norm)
+                {
+                    self.search_query.pop();
+                }
+            }
+            self.search_query.push(altgr_ch);
+            self.update_search_filter();
+            return app::Task::none();
+        }
+
+        if let Some(message) = shortcut_message(&input.key, input.modifiers) {
+            return self.update(message);
+        }
+        if in_popup {
+            // The search input handles its own typing.
+            return app::Task::none();
+        }
+
+        match input.key.as_ref() {
+            Key::Named(Named::Enter) => return self.update(Message::SubmitSearch),
+            Key::Named(Named::Backspace) => {
+                self.search_query.pop();
+                self.update_search_filter();
+                return app::Task::none();
+            }
+            _ => {}
+        }
+        if !input.modifiers.control()
+            && !input.modifiers.logo()
+            && let Some(text) = input.text.as_deref()
+        {
+            let printable: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !printable.is_empty() {
+                self.search_query.push_str(&printable);
+                self.update_search_filter();
+            }
         }
         app::Task::none()
+    }
+
+    /// Gives keyboard focus to the note editor. `text_input::focus` emits the generic
+    /// iced focus operation, which matches any focusable widget by id, including
+    /// `text_editor`.
+    fn focus_editor(&self) -> app::Task<Message> {
+        text_input::focus(self.editor_id.clone())
     }
 
     fn persist_config(&self) {
@@ -214,7 +494,7 @@ impl cosmic::Application for ScratchpadApp {
             let title = storage::derive_title(&text, &fallback);
             let word_chars = ui::count_words_and_chars(&text);
             let last_mtime = storage::note_mtime(&path);
-            let content = Content::with_text(&text);
+            let content = content_at_end(&text);
             notes.push(NoteItem {
                 path,
                 filename,
@@ -253,6 +533,7 @@ impl cosmic::Application for ScratchpadApp {
             search_query: String::new(),
             filtered_indices,
             altgr_map: Arc::new(ui::AltGrMap::load_system()),
+            editor_id: cosmic::iced::core::widget::Id::unique(),
         };
 
         (app, app::Task::none())
@@ -266,7 +547,7 @@ impl cosmic::Application for ScratchpadApp {
         match message {
             Message::TogglePopup => {
                 tracing::info!("TogglePopup invoked, current popup={:?}", self.popup);
-                ALTGR_ACTIVE.store(false, Ordering::SeqCst);
+                reset_key_state();
                 if let Some(p) = self.popup.take() {
                     let save_task = self.save_note_async(self.active_index);
                     self.persist_config();
@@ -286,12 +567,14 @@ impl cosmic::Application for ScratchpadApp {
                         let fallback = fl!("note-title-fallback", index = (i + 1));
                         note.title = storage::derive_title(&reloaded, &fallback);
                         note.word_chars = ui::count_words_and_chars(&reloaded);
-                        note.content = Content::with_text(&reloaded);
+                        note.content = content_at_end(&reloaded);
                         note.last_mtime = Some(new_mtime);
                     }
                 }
                 self.update_search_filter();
 
+                // Focus is applied from `PopupFocusGained` once the popup surface
+                // exists; a focus operation issued here would find no widget tree.
                 cosmic::surface::surface_task(cosmic::surface::action::app_popup(
                     |_| Default::default(),
                     |app: &mut Self| {
@@ -318,7 +601,7 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::CloseRequested(id) => {
                 if self.popup == Some(id) {
-                    ALTGR_ACTIVE.store(false, Ordering::SeqCst);
+                    reset_key_state();
                     let save_task = self.save_note_async(self.active_index);
                     self.persist_config();
                     self.popup = None;
@@ -378,7 +661,7 @@ impl cosmic::Application for ScratchpadApp {
                             path: new_path,
                             filename,
                             title,
-                            content: Content::with_text(&text),
+                            content: content_at_end(&text),
                             word_chars,
                             last_edit_time: None,
                             last_mtime,
@@ -400,7 +683,7 @@ impl cosmic::Application for ScratchpadApp {
                     }
                 }
 
-                save_task
+                app::Task::batch([save_task, self.focus_editor()])
             }
 
             Message::DeleteActiveNote => {
@@ -449,10 +732,11 @@ impl cosmic::Application for ScratchpadApp {
                     .map(|n| n.filename.clone());
                 self.update_search_filter();
 
-                app::Task::future(async move {
+                let banner_task = app::Task::future(async move {
                     tokio::time::sleep(Duration::from_secs(UNDO_BANNER_SECS)).await;
                     cosmic::Action::App(Message::DismissUndoBanner(generation))
-                })
+                });
+                app::Task::batch([self.focus_editor(), banner_task])
             }
 
             Message::UndoDelete => {
@@ -473,7 +757,7 @@ impl cosmic::Application for ScratchpadApp {
                         path: path.clone(),
                         filename,
                         title,
-                        content: Content::with_text(&content_text),
+                        content: content_at_end(&content_text),
                         word_chars,
                         last_edit_time: None,
                         last_mtime,
@@ -503,6 +787,7 @@ impl cosmic::Application for ScratchpadApp {
                         .get(self.active_index)
                         .map(|n| n.filename.clone());
                     self.update_search_filter();
+                    return self.focus_editor();
                 }
                 app::Task::none()
             }
@@ -520,11 +805,9 @@ impl cosmic::Application for ScratchpadApp {
                 self.is_searching = !self.is_searching;
                 if self.is_searching {
                     self.update_search_filter();
-                    return text_input::focus(cosmic::iced::core::widget::Id::new(
-                        "nv_search_input",
-                    ));
+                    return focus_search_input();
                 }
-                app::Task::none()
+                self.focus_editor()
             }
 
             Message::SearchInputChanged(query) => {
@@ -650,7 +933,7 @@ impl cosmic::Application for ScratchpadApp {
                 if self.is_searching {
                     self.is_searching = false;
                     self.search_query.clear();
-                    return app::Task::none();
+                    return self.focus_editor();
                 }
 
                 if let Some(p) = self.popup.take() {
@@ -663,107 +946,91 @@ impl cosmic::Application for ScratchpadApp {
                 app::Task::none()
             }
 
-            Message::AltGrSearchInput(key, physical, shift, text_ch) => {
-                if self.is_searching
-                    && let Some((normal_ch, altgr_ch)) =
-                        self.altgr_map.resolve_key(&key, physical, shift)
-                    && text_ch != Some(altgr_ch)
-                {
-                    if let Some(norm) = normal_ch
-                        && self.search_query.ends_with(norm)
-                    {
-                        self.search_query.pop();
-                    }
-                    self.search_query.push(altgr_ch);
-                    self.update_search_filter();
+            Message::KeyInput(window, input) => self.handle_uncaptured_key(window, input),
+
+            Message::PopupFocusGained(id) => {
+                if self.popup != Some(id) {
+                    return app::Task::none();
                 }
-                app::Task::none()
+                if self.is_searching {
+                    focus_search_input()
+                } else {
+                    self.focus_editor()
+                }
             }
         }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
+        // `Opened` fires on the popup's first configure, after its widget tree
+        // is built. `PopupEvent::Focused` fires when the compositor hands the
+        // popup keyboard focus. Both can arrive before a subscription gated on
+        // `self.popup` is registered, so this one stays active at all times.
+        let focus_sub = cosmic::iced::event::listen_with(|event, _status, window_id| match event {
+            cosmic::iced::core::Event::PlatformSpecific(
+                cosmic::iced::core::event::PlatformSpecific::Wayland(
+                    cosmic::iced::core::event::wayland::Event::Popup(
+                        cosmic::iced::core::event::wayland::PopupEvent::Focused,
+                        _,
+                        _,
+                    ),
+                ),
+            )
+            | cosmic::iced::core::Event::Window(cosmic::iced::core::window::Event::Opened {
+                ..
+            }) => Some(Message::PopupFocusGained(window_id)),
+            _ => None,
+        });
+
         if self.popup.is_some() {
-            cosmic::iced::keyboard::listen().filter_map(|event| match event {
-                cosmic::iced::core::keyboard::Event::KeyPressed {
-                    key,
-                    modifiers,
-                    physical_key,
-                    text,
-                    ..
-                } => {
-                    if ui::is_altgr_key(&key, physical_key) {
-                        ALTGR_ACTIVE.store(true, Ordering::SeqCst);
-                        return None;
-                    }
-                    let altgr_held = (ALTGR_ACTIVE.load(Ordering::SeqCst)
-                        && !modifiers.control()
-                        && !modifiers.logo())
-                        || (modifiers.control() && modifiers.alt() && !modifiers.logo());
-                    if altgr_held {
-                        let text_ch = text.as_deref().and_then(|s| s.chars().next());
-                        return Some(Message::AltGrSearchInput(
+            let keyboard_sub =
+                cosmic::iced::event::listen_with(|event, status, window_id| match event {
+                    cosmic::iced::core::Event::Keyboard(
+                        cosmic::iced::core::keyboard::Event::KeyPressed {
                             key,
+                            modified_key,
                             physical_key,
-                            modifiers.shift(),
-                            text_ch,
-                        ));
+                            modifiers,
+                            text,
+                            ..
+                        },
+                    ) => {
+                        if ui::is_altgr_key(&key, physical_key) {
+                            ALTGR_ACTIVE.store(true, Ordering::SeqCst);
+                            return None;
+                        }
+                        track_modifier(&key, true);
+                        if matches!(status, cosmic::iced::core::event::Status::Captured) {
+                            return None;
+                        }
+                        Some(Message::KeyInput(
+                            window_id,
+                            KeyInput {
+                                key,
+                                modified_key,
+                                physical_key,
+                                modifiers,
+                                text,
+                            },
+                        ))
                     }
-                    if key
-                        == cosmic::iced::core::keyboard::Key::Named(
-                            cosmic::iced::core::keyboard::key::Named::Escape,
-                        )
-                    {
-                        Some(Message::EscapePressed)
-                    } else if modifiers.command()
-                        && !modifiers.alt()
-                        && (key.as_ref() == Key::Character("f")
-                            || key.as_ref() == Key::Character("F")
-                            || key.as_ref() == Key::Character("k")
-                            || key.as_ref() == Key::Character("K"))
-                    {
-                        Some(Message::ToggleSearch)
-                    } else if modifiers.command()
-                        && !modifiers.alt()
-                        && (key.as_ref() == Key::Character("n")
-                            || key.as_ref() == Key::Character("N"))
-                    {
-                        Some(Message::NewNote(None))
-                    } else if modifiers.command()
-                        && !modifiers.alt()
-                        && (key.as_ref() == Key::Character("[")
-                            || key == Key::Named(Named::ArrowLeft))
-                    {
-                        Some(Message::PrevNote)
-                    } else if modifiers.command()
-                        && !modifiers.alt()
-                        && (key.as_ref() == Key::Character("]")
-                            || key == Key::Named(Named::ArrowRight))
-                    {
-                        Some(Message::NextNote)
-                    } else if modifiers.command()
-                        && !modifiers.alt()
-                        && modifiers.shift()
-                        && (key.as_ref() == cosmic::iced::core::keyboard::Key::Character("c")
-                            || key.as_ref() == cosmic::iced::core::keyboard::Key::Character("C"))
-                    {
-                        Some(Message::CopyAll)
-                    } else {
+                    cosmic::iced::core::Event::Keyboard(
+                        cosmic::iced::core::keyboard::Event::KeyReleased {
+                            key, physical_key, ..
+                        },
+                    ) => {
+                        if ui::is_altgr_key(&key, physical_key) {
+                            ALTGR_ACTIVE.store(false, Ordering::SeqCst);
+                        }
+                        track_modifier(&key, false);
                         None
                     }
-                }
-                cosmic::iced::core::keyboard::Event::KeyReleased {
-                    key, physical_key, ..
-                } => {
-                    if ui::is_altgr_key(&key, physical_key) {
-                        ALTGR_ACTIVE.store(false, Ordering::SeqCst);
-                    }
-                    None
-                }
-                _ => None,
-            })
+                    _ => None,
+                });
+
+            Subscription::batch([keyboard_sub, focus_sub])
         } else {
-            Subscription::none()
+            focus_sub
         }
     }
 
@@ -784,7 +1051,7 @@ impl cosmic::Application for ScratchpadApp {
                 // Notational Velocity Search View
                 let search_bar =
                     text_input::search_input(fl!("search-placeholder"), &self.search_query)
-                        .id(cosmic::iced::core::widget::Id::new("nv_search_input"))
+                        .id(cosmic::iced::core::widget::Id::new(SEARCH_INPUT_ID))
                         .on_input(Message::SearchInputChanged)
                         .on_submit(|_| Message::SubmitSearch)
                         .width(Length::Fill);
@@ -1136,6 +1403,7 @@ impl cosmic::Application for ScratchpadApp {
             // 4. Text Editor with Font Size & Line Wrapping
             let altgr_map = Arc::clone(&self.altgr_map);
             let editor = text_editor::text_editor(&self.notes[self.active_index].content)
+                .id(self.editor_id.clone())
                 .placeholder(fl!("placeholder"))
                 .size(self.config.font_size)
                 .wrapping(if self.config.wrap_lines {
@@ -1143,67 +1411,7 @@ impl cosmic::Application for ScratchpadApp {
                 } else {
                     cosmic::iced::core::text::Wrapping::None
                 })
-                .key_binding(move |keypress| {
-                    if ui::is_altgr_key(&keypress.key, keypress.physical_key) {
-                        ALTGR_ACTIVE.store(true, Ordering::SeqCst);
-                        return None;
-                    }
-                    let altgr_held = (ALTGR_ACTIVE.load(Ordering::SeqCst)
-                        && !keypress.modifiers.control()
-                        && !keypress.modifiers.logo())
-                        || (keypress.modifiers.control()
-                            && keypress.modifiers.alt()
-                            && !keypress.modifiers.logo());
-                    if altgr_held
-                        && matches!(keypress.status, text_editor::Status::Focused { .. })
-                        && let Some((_, altgr_ch)) = altgr_map.resolve_key(
-                            &keypress.key,
-                            keypress.physical_key,
-                            keypress.modifiers.shift(),
-                        )
-                    {
-                        return Some(text_editor::Binding::Insert(altgr_ch));
-                    }
-
-                    if keypress.key == Key::Named(Named::Escape) {
-                        Some(text_editor::Binding::Custom(Message::EscapePressed))
-                    } else if keypress.modifiers.command()
-                        && !keypress.modifiers.alt()
-                        && (keypress.key.as_ref() == Key::Character("f")
-                            || keypress.key.as_ref() == Key::Character("F")
-                            || keypress.key.as_ref() == Key::Character("k")
-                            || keypress.key.as_ref() == Key::Character("K"))
-                    {
-                        Some(text_editor::Binding::Custom(Message::ToggleSearch))
-                    } else if keypress.modifiers.command()
-                        && !keypress.modifiers.alt()
-                        && (keypress.key.as_ref() == Key::Character("n")
-                            || keypress.key.as_ref() == Key::Character("N"))
-                    {
-                        Some(text_editor::Binding::Custom(Message::NewNote(None)))
-                    } else if keypress.modifiers.command()
-                        && !keypress.modifiers.alt()
-                        && (keypress.key.as_ref() == Key::Character("[")
-                            || keypress.key == Key::Named(Named::ArrowLeft))
-                    {
-                        Some(text_editor::Binding::Custom(Message::PrevNote))
-                    } else if keypress.modifiers.command()
-                        && !keypress.modifiers.alt()
-                        && (keypress.key.as_ref() == Key::Character("]")
-                            || keypress.key == Key::Named(Named::ArrowRight))
-                    {
-                        Some(text_editor::Binding::Custom(Message::NextNote))
-                    } else if keypress.modifiers.command()
-                        && !keypress.modifiers.alt()
-                        && keypress.modifiers.shift()
-                        && (keypress.key.as_ref() == Key::Character("c")
-                            || keypress.key.as_ref() == Key::Character("C"))
-                    {
-                        Some(text_editor::Binding::Custom(Message::CopyAll))
-                    } else {
-                        text_editor::Binding::from_key_press(keypress)
-                    }
-                })
+                .key_binding(move |keypress| editor_binding(&altgr_map, keypress))
                 .height(Length::Fill)
                 .padding(10)
                 .on_action(Message::EditorAction);
@@ -1254,5 +1462,126 @@ impl cosmic::Application for ScratchpadApp {
         } else {
             cosmic::widget::text("").into()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::core::widget::{Id, Tree, tree};
+
+    fn editor_column<'a>(content: &'a Content, id: Id) -> cosmic::Element<'a, Message> {
+        cosmic::widget::column::Column::new()
+            .push(text_editor::text_editor(content).id(id))
+            .into()
+    }
+
+    /// Mirrors `UserInterface::build`: named states are taken out of the previous
+    /// tree, then restored while diffing against the new view.
+    fn rebuild_keeps_editor_state(id: Id) -> bool {
+        let content = Content::with_text("hello");
+        let mut tree = Tree::new(editor_column(&content, id.clone()));
+        let named = tree.take_all_named();
+        tree::NAMED.with(|n| *n.borrow_mut() = named);
+        tree.diff(editor_column(&content, id).as_widget_mut());
+        tree::NAMED.with(|n| n.borrow_mut().clear());
+        // column -> context-menu wrapper -> inner iced editor
+        !matches!(tree.children[0].children[0].state, tree::State::None)
+    }
+
+    #[test]
+    fn unique_editor_id_survives_rebuild() {
+        assert!(rebuild_keeps_editor_state(Id::unique()));
+    }
+
+    /// Documents the upstream behavior that forces `editor_id` to be unique. If this
+    /// starts failing, libcosmic fixed the wrapper and a named id becomes usable.
+    #[test]
+    fn named_editor_id_loses_state_on_rebuild() {
+        assert!(!rebuild_keeps_editor_state(Id::new("scratchpad_editor")));
+    }
+
+    fn char_key(c: &str) -> Key {
+        Key::Character(SmolStr::new(c))
+    }
+
+    #[test]
+    fn shortcut_message_maps_app_shortcuts() {
+        let ctrl = Modifiers::CTRL;
+        assert!(matches!(
+            shortcut_message(&char_key("f"), ctrl),
+            Some(Message::ToggleSearch)
+        ));
+        assert!(matches!(
+            shortcut_message(&char_key("n"), ctrl),
+            Some(Message::NewNote(None))
+        ));
+        assert!(matches!(
+            shortcut_message(&char_key("C"), ctrl | Modifiers::SHIFT),
+            Some(Message::CopyAll)
+        ));
+        assert!(matches!(
+            shortcut_message(&Key::Named(Named::Escape), Modifiers::empty()),
+            Some(Message::EscapePressed)
+        ));
+        // Plain typing and Ctrl+C (editor copy) are not app shortcuts.
+        assert!(shortcut_message(&char_key("f"), Modifiers::empty()).is_none());
+        assert!(shortcut_message(&char_key("c"), ctrl).is_none());
+        // Ctrl+Alt is AltGr on some setups and must not trigger shortcuts.
+        assert!(shortcut_message(&char_key("f"), ctrl | Modifiers::ALT).is_none());
+    }
+
+    fn keypress(key: Key, modifiers: Modifiers, text: Option<&str>) -> KeyPress {
+        KeyPress {
+            modified_key: key.clone(),
+            key,
+            physical_key: Physical::Unidentified(
+                cosmic::iced::core::keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(SmolStr::new),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    #[test]
+    fn editor_binding_inserts_text_and_routes_shortcuts() {
+        let map = ui::AltGrMap::default();
+        let typed = editor_binding(&map, keypress(char_key("a"), Modifiers::empty(), Some("a")));
+        assert!(matches!(typed, Some(Binding::Insert('a'))));
+
+        let search = editor_binding(&map, keypress(char_key("f"), Modifiers::CTRL, None));
+        assert!(matches!(
+            search,
+            Some(Binding::Custom(Message::ToggleSearch))
+        ));
+
+        let enter = editor_binding(
+            &map,
+            keypress(Key::Named(Named::Enter), Modifiers::empty(), Some("\r")),
+        );
+        assert!(matches!(enter, Some(Binding::Enter)));
+    }
+
+    #[test]
+    fn tracked_modifiers_follow_press_and_release() {
+        reset_key_state();
+        track_modifier(&Key::Named(Named::Control), true);
+        track_modifier(&Key::Named(Named::Shift), true);
+        assert_eq!(held_modifiers(), Modifiers::CTRL | Modifiers::SHIFT);
+        track_modifier(&Key::Named(Named::Control), false);
+        assert_eq!(held_modifiers(), Modifiers::SHIFT);
+        track_modifier(&char_key("a"), true);
+        assert_eq!(held_modifiers(), Modifiers::SHIFT);
+        reset_key_state();
+        assert_eq!(held_modifiers(), Modifiers::empty());
+    }
+
+    #[test]
+    fn content_at_end_places_cursor_after_last_char() {
+        let content = content_at_end("one\ntwo");
+        let cursor = content.cursor();
+        assert_eq!(cursor.position.line, 1);
+        assert_eq!(cursor.position.column, 3);
     }
 }

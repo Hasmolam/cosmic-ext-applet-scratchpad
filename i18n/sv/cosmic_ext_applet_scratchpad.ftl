@@ -9,6 +9,7 @@ action-clear = Rensa
 action-undo = Ångra
 status-saved = Sparad
 status-editing = Redigering...
+status-save-failed = Kunde inte spara
 status-count = { $words } ord · { $chars } tecken
 banner-cleared = Anteckning rensad.
 banner-deleted = Anteckning borttagen.

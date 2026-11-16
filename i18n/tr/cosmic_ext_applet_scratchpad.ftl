@@ -9,6 +9,7 @@ action-clear = Temizle
 action-undo = Geri Al
 status-saved = Kaydedildi
 status-editing = Düzenleniyor...
+status-save-failed = Kaydedilemedi
 status-count = { $words } kelime · { $chars } karakter
 banner-cleared = Not temizlendi.
 banner-deleted = Not silindi.

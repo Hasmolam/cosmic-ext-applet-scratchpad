@@ -2,6 +2,7 @@
 
 pub mod config;
 mod localize;
+pub mod save_state;
 pub mod storage;
 pub mod ui;
 
@@ -19,6 +20,7 @@ use cosmic::widget::{
     button, container, icon, scrollable, space, text, text_editor, text_input, tooltip,
 };
 use cosmic::{Application, Element, app, theme};
+use save_state::{NoteId, SaveState};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -151,6 +153,7 @@ pub fn run() -> cosmic::iced::Result {
 }
 
 pub struct NoteItem {
+    pub id: NoteId,
     pub path: PathBuf,
     pub filename: String,
     pub title: String,
@@ -158,7 +161,45 @@ pub struct NoteItem {
     pub word_chars: (usize, usize),
     pub last_edit_time: Option<Instant>,
     pub last_mtime: Option<SystemTime>,
-    pub saved: bool,
+    pub save: SaveState,
+}
+
+impl NoteItem {
+    /// Builds a note whose in-memory text matches what is on disk at `path`.
+    fn from_text(id: NoteId, path: PathBuf, text: &str, fallback_title: &str) -> Self {
+        let filename = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let last_mtime = storage::note_mtime(&path);
+        Self {
+            id,
+            path,
+            filename,
+            title: storage::derive_title(text, fallback_title),
+            content: content_at_end(text),
+            word_chars: ui::count_words_and_chars(text),
+            last_edit_time: None,
+            last_mtime,
+            save: SaveState::default(),
+        }
+    }
+}
+
+/// A delete that waits for an in-flight save of the same note to finish, so the
+/// write cannot recreate the file after it was moved to the trash.
+struct PendingDelete {
+    id: NoteId,
+    path: PathBuf,
+    save: SaveState,
+}
+
+/// Result of a background note write.
+#[derive(Debug, Clone, Copy)]
+pub enum SaveOutcome {
+    Saved(Option<SystemTime>),
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -176,8 +217,8 @@ pub enum Message {
     SearchInputChanged(String),
     SubmitSearch,
     EditorAction(Action),
-    DebounceTimeout(usize),
-    NoteSaved(usize, Option<SystemTime>),
+    DebounceTimeout(NoteId),
+    NoteSaved(NoteId, u64, SaveOutcome),
     CopyAll,
     ResetCopyStatus(u64),
     ToggleSettings,
@@ -195,6 +236,8 @@ pub struct ScratchpadApp {
     config_handler: Option<cosmic::cosmic_config::Config>,
     popup: Option<window::Id>,
     notes: Vec<NoteItem>,
+    next_note_id: NoteId,
+    pending_deletes: Vec<PendingDelete>,
     active_index: usize,
     copied_recently: bool,
     copy_generation: u64,
@@ -248,35 +291,79 @@ impl ScratchpadApp {
         }
     }
 
+    fn alloc_note_id(&mut self) -> NoteId {
+        let id = self.next_note_id;
+        self.next_note_id = self.next_note_id.wrapping_add(1);
+        id
+    }
+
+    fn note_index(&self, id: NoteId) -> Option<usize> {
+        self.notes.iter().position(|note| note.id == id)
+    }
+
+    /// Starts a background write of the note at `index` if it has unsaved
+    /// changes. At most one write per note runs at a time; a request made while
+    /// one is running is replayed from `NoteSaved` with the latest content.
     fn save_note_async(&mut self, index: usize) -> app::Task<Message> {
-        if let Some(note) = self.notes.get_mut(index)
-            && !note.saved
-        {
-            note.saved = true;
-            note.last_edit_time = None;
-            let text = note.content.text();
-            let path = note.path.clone();
-            return app::Task::future(async move {
-                let res = tokio::task::spawn_blocking(move || {
-                    storage::save_note_atomic(&path, &text).map(|()| storage::note_mtime(&path))
-                })
-                .await;
-                match res {
-                    Ok(Ok(mtime)) => cosmic::Action::App(Message::NoteSaved(index, mtime)),
-                    Ok(Err(err)) => {
-                        tracing::error!(
-                            ?err,
-                            index,
-                            "Failed to save note atomically in background"
-                        );
-                        cosmic::Action::App(Message::NoteSaved(index, None))
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, index, "Failed to join save task");
-                        cosmic::Action::App(Message::NoteSaved(index, None))
-                    }
+        let Some(note) = self.notes.get_mut(index) else {
+            return app::Task::none();
+        };
+        let Some(revision) = note.save.begin() else {
+            return app::Task::none();
+        };
+        note.last_edit_time = None;
+        let id = note.id;
+        let text = note.content.text();
+        let path = note.path.clone();
+        app::Task::future(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                storage::save_note_atomic(&path, &text).map(|()| storage::note_mtime(&path))
+            })
+            .await;
+            let outcome = match res {
+                Ok(Ok(mtime)) => SaveOutcome::Saved(mtime),
+                Ok(Err(err)) => {
+                    tracing::error!(?err, id, "Failed to save note atomically in background");
+                    SaveOutcome::Failed
                 }
-            });
+                Err(err) => {
+                    tracing::error!(?err, id, "Failed to join save task");
+                    SaveOutcome::Failed
+                }
+            };
+            cosmic::Action::App(Message::NoteSaved(id, revision, outcome))
+        })
+    }
+
+    fn handle_note_saved(
+        &mut self,
+        id: NoteId,
+        revision: u64,
+        outcome: SaveOutcome,
+    ) -> app::Task<Message> {
+        let ok = matches!(outcome, SaveOutcome::Saved(_));
+
+        if let Some(index) = self.note_index(id) {
+            let note = &mut self.notes[index];
+            let follow_up = note.save.finish(revision, ok);
+            if let SaveOutcome::Saved(Some(mtime)) = outcome {
+                note.last_mtime = Some(mtime);
+            }
+            if follow_up {
+                return self.save_note_async(index);
+            }
+            return app::Task::none();
+        }
+
+        // The note was deleted while this write ran; finish the delete now that
+        // no write for it is outstanding. This stays synchronous like the
+        // immediate path in `DeleteActiveNote`: a background delete could run
+        // after an `UndoDelete` write of the same path and remove the restored file.
+        if let Some(pos) = self.pending_deletes.iter().position(|p| p.id == id) {
+            let pending = self.pending_deletes.remove(pos);
+            if let Err(err) = storage::delete_note(&pending.path) {
+                tracing::error!(?err, path = ?pending.path, "Failed to delete note");
+            }
         }
         app::Task::none()
     }
@@ -484,28 +571,11 @@ impl cosmic::Application for ScratchpadApp {
 
         let mut notes = Vec::with_capacity(note_paths.len());
         for (i, path) in note_paths.into_iter().enumerate() {
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let fallback = fl!("note-title-fallback", index = (i + 1));
-            let title = storage::derive_title(&text, &fallback);
-            let word_chars = ui::count_words_and_chars(&text);
-            let last_mtime = storage::note_mtime(&path);
-            let content = content_at_end(&text);
-            notes.push(NoteItem {
-                path,
-                filename,
-                title,
-                content,
-                word_chars,
-                last_edit_time: None,
-                last_mtime,
-                saved: true,
-            });
+            notes.push(NoteItem::from_text(i as NoteId, path, &text, &fallback));
         }
+        let next_note_id = notes.len() as NoteId;
 
         let active_index = if let Some(ref file) = config.active_file {
             notes.iter().position(|n| n.filename == *file).unwrap_or(0)
@@ -523,6 +593,8 @@ impl cosmic::Application for ScratchpadApp {
             config_handler,
             popup: None,
             notes,
+            next_note_id,
+            pending_deletes: Vec::new(),
             active_index,
             copied_recently: false,
             copy_generation: 0,
@@ -560,7 +632,7 @@ impl cosmic::Application for ScratchpadApp {
 
                 // If opening, check for external disk edits on all notes
                 for (i, note) in self.notes.iter_mut().enumerate() {
-                    if note.saved
+                    if note.save.is_saved()
                         && let Ok(Some((reloaded, new_mtime))) =
                             storage::load_note_if_modified(&note.path, note.last_mtime)
                     {
@@ -639,34 +711,15 @@ impl cosmic::Application for ScratchpadApp {
             Message::SelectNote(target) => self.select_note_internal(target),
 
             Message::NewNote(title_opt) => {
-                let prev_idx = self.active_index;
-                let save_task = self.save_note_async(prev_idx);
+                let save_task = self.save_note_async(self.active_index);
 
-                let title_ref = title_opt.as_deref();
-                match storage::create_new_note(title_ref) {
+                match storage::create_new_note(title_opt.as_deref()) {
                     Ok(new_path) => {
-                        let filename = new_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
                         let text = std::fs::read_to_string(&new_path).unwrap_or_default();
-                        let word_chars = ui::count_words_and_chars(&text);
-                        let last_mtime = storage::note_mtime(&new_path);
-                        let note_idx = self.notes.len() + 1;
-                        let fallback = fl!("note-title-fallback", index = note_idx);
-                        let title = storage::derive_title(&text, &fallback);
-
-                        self.notes.push(NoteItem {
-                            path: new_path,
-                            filename,
-                            title,
-                            content: content_at_end(&text),
-                            word_chars,
-                            last_edit_time: None,
-                            last_mtime,
-                            saved: true,
-                        });
+                        let fallback = fl!("note-title-fallback", index = (self.notes.len() + 1));
+                        let id = self.alloc_note_id();
+                        self.notes
+                            .push(NoteItem::from_text(id, new_path, &text, &fallback));
 
                         self.active_index = self.notes.len() - 1;
                         self.is_searching = false;
@@ -693,35 +746,30 @@ impl cosmic::Application for ScratchpadApp {
 
                 let deleted_idx = self.active_index;
                 let target_note = self.notes.remove(deleted_idx);
-                let _ = storage::delete_note(&target_note.path);
+                let deleted_text = target_note.content.text();
+
+                if target_note.save.is_in_flight() {
+                    // Deleting now would let the running write recreate the file.
+                    self.pending_deletes.push(PendingDelete {
+                        id: target_note.id,
+                        path: target_note.path.clone(),
+                        save: target_note.save,
+                    });
+                } else if let Err(err) = storage::delete_note(&target_note.path) {
+                    tracing::error!(?err, path = ?target_note.path, "Failed to delete note");
+                }
 
                 self.undo_generation = self.undo_generation.wrapping_add(1);
                 let generation = self.undo_generation;
-                self.undo_cache = Some((
-                    generation,
-                    target_note.path.clone(),
-                    target_note.content.text(),
-                ));
+                self.undo_cache = Some((generation, target_note.path, deleted_text));
 
                 if self.notes.is_empty()
                     && let Ok(new_path) = storage::create_new_note(None)
                 {
-                    let filename = new_path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
                     let fallback = fl!("note-title-fallback", index = 1);
-                    self.notes.push(NoteItem {
-                        path: new_path.clone(),
-                        filename,
-                        title: fallback,
-                        content: Content::with_text(""),
-                        word_chars: (0, 0),
-                        last_edit_time: None,
-                        last_mtime: storage::note_mtime(&new_path),
-                        saved: true,
-                    });
+                    let id = self.alloc_note_id();
+                    self.notes
+                        .push(NoteItem::from_text(id, new_path, "", &fallback));
                 }
 
                 self.active_index = self.active_index.min(self.notes.len().saturating_sub(1));
@@ -741,35 +789,32 @@ impl cosmic::Application for ScratchpadApp {
 
             Message::UndoDelete => {
                 if let Some((_, path, content_text)) = self.undo_cache.take() {
-                    let _ = storage::atomic_write(&path, &content_text);
-                    let filename = path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let word_chars = ui::count_words_and_chars(&content_text);
-                    let last_mtime = storage::note_mtime(&path);
-                    let note_idx = self.notes.len() + 1;
-                    let fallback = fl!("note-title-fallback", index = note_idx);
-                    let title = storage::derive_title(&content_text, &fallback);
+                    let fallback = fl!("note-title-fallback", index = (self.notes.len() + 1));
 
-                    let restored = NoteItem {
-                        path: path.clone(),
-                        filename,
-                        title,
-                        content: content_at_end(&content_text),
-                        word_chars,
-                        last_edit_time: None,
-                        last_mtime,
-                        saved: true,
+                    // If the deleted note's last write is still running, reuse its id
+                    // and save state so that completion is matched to the restored
+                    // note and the restored text is written after it, not raced.
+                    let mut restored = if let Some(pos) =
+                        self.pending_deletes.iter().position(|p| p.path == path)
+                    {
+                        let pending = self.pending_deletes.remove(pos);
+                        let mut note =
+                            NoteItem::from_text(pending.id, path.clone(), &content_text, &fallback);
+                        note.save = pending.save;
+                        note
+                    } else {
+                        let id = self.alloc_note_id();
+                        NoteItem::from_text(id, path.clone(), &content_text, &fallback)
                     };
+                    // The file is gone or about to be; write it back in the background.
+                    restored.save.mark_edited();
 
                     if let Some(pos) = self.notes.iter().position(|n| n.path == path) {
                         self.notes[pos] = restored;
                         self.active_index = pos;
                     } else if self.notes.len() == 1
                         && self.notes[0].content.text().trim().is_empty()
-                        && self.notes[0].saved
+                        && self.notes[0].save.is_saved()
                     {
                         if self.notes[0].path != path {
                             let _ = std::fs::remove_file(&self.notes[0].path);
@@ -787,7 +832,9 @@ impl cosmic::Application for ScratchpadApp {
                         .get(self.active_index)
                         .map(|n| n.filename.clone());
                     self.update_search_filter();
-                    return self.focus_editor();
+                    // Starts the write, or queues it behind the running one.
+                    let save_task = self.save_note_async(self.active_index);
+                    return app::Task::batch([save_task, self.focus_editor()]);
                 }
                 app::Task::none()
             }
@@ -845,40 +892,37 @@ impl cosmic::Application for ScratchpadApp {
                 self.update(Message::NewNote(Some(query)))
             }
 
-            Message::NoteSaved(idx, maybe_mtime) => {
-                if let Some(note) = self.notes.get_mut(idx)
-                    && let Some(mtime) = maybe_mtime
-                {
-                    note.last_mtime = Some(mtime);
-                }
-                app::Task::none()
+            Message::NoteSaved(id, revision, outcome) => {
+                self.handle_note_saved(id, revision, outcome)
             }
 
             Message::EditorAction(action) => {
                 let idx = self.active_index;
                 let is_edit = action.is_edit();
+                let mut edited_id = None;
                 if let Some(note) = self.notes.get_mut(idx) {
                     note.content.perform(action);
                     if is_edit {
-                        note.saved = false;
+                        note.save.mark_edited();
                         note.last_edit_time = Some(Instant::now());
+                        edited_id = Some(note.id);
                     }
                 }
 
-                if is_edit {
+                if let Some(id) = edited_id {
                     self.update_note_meta(idx);
                     app::Task::future(async move {
                         tokio::time::sleep(Duration::from_millis(DEBOUNCE_MILLIS)).await;
-                        cosmic::Action::App(Message::DebounceTimeout(idx))
+                        cosmic::Action::App(Message::DebounceTimeout(id))
                     })
                 } else {
                     app::Task::none()
                 }
             }
 
-            Message::DebounceTimeout(idx) => {
-                if let Some(note) = self.notes.get(idx)
-                    && let Some(last_time) = note.last_edit_time
+            Message::DebounceTimeout(id) => {
+                if let Some(idx) = self.note_index(id)
+                    && let Some(last_time) = self.notes[idx].last_edit_time
                     && last_time.elapsed() >= Duration::from_millis(DEBOUNCE_MILLIS - 50)
                 {
                     return self.save_note_async(idx);
@@ -1426,7 +1470,15 @@ impl cosmic::Application for ScratchpadApp {
 
             let counter_label = text::caption(fl!("status-count", words = words, chars = chars));
 
-            let status_label = if self.notes[self.active_index].saved {
+            let save = &self.notes[self.active_index].save;
+            let status_label = if save.has_failed() {
+                text::caption(format!("● {}", fl!("status-save-failed"))).class(
+                    theme::Text::Custom(|theme| cosmic::iced::widget::text::Style {
+                        color: Some(theme.cosmic().destructive_text_color().into()),
+                        ..Default::default()
+                    }),
+                )
+            } else if save.is_saved() {
                 text::caption(format!("● {}", fl!("status-saved")))
             } else {
                 text::caption(format!("● {}", fl!("status-editing"))).class(theme::Text::Accent)

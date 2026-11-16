@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 pub const TOTAL_PADS: usize = 3;
@@ -216,21 +217,45 @@ pub fn atomic_write(target_path: &Path, content: &str) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path"))?;
 
+    // Each write gets its own temp file. A shared name lets two concurrent
+    // writes of the same note truncate each other's data before the rename.
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = file_name.to_os_string();
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    tmp_name.push(format!(".tmp.{}.{}", std::process::id(), seq));
     let tmp_path = real_target.with_file_name(tmp_name);
 
+    let result = write_tmp_and_rename(
+        &tmp_path,
+        &real_target,
+        content,
+        existing_permissions.as_ref(),
+    );
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn write_tmp_and_rename(
+    tmp_path: &Path,
+    target: &Path,
+    content: &str,
+    permissions: Option<&fs::Permissions>,
+) -> io::Result<()> {
     {
-        let mut file = File::create(&tmp_path)?;
-        if let Some(perms) = existing_permissions {
-            let _ = fs::set_permissions(&tmp_path, perms);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp_path)?;
+        if let Some(perms) = permissions {
+            let _ = file.set_permissions(perms.clone());
         }
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
     }
-
-    fs::rename(&tmp_path, &real_target)?;
-    Ok(())
+    fs::rename(tmp_path, target)
 }
 
 /// Returns the last modification time of the file on disk if it exists.
@@ -439,6 +464,63 @@ pub mod tests {
         assert!(entries.iter().all(|name| !name.contains(".tmp.")));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_concurrent_atomic_writes_do_not_collide() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("pad_1.md");
+        atomic_write(&file_path, "seed").unwrap();
+
+        let contents: Vec<String> = (0..16).map(|i| format!("{i}").repeat(4096)).collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = contents
+                .iter()
+                .map(|content| {
+                    let path = &file_path;
+                    scope.spawn(move || atomic_write(path, content))
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        });
+
+        // Every write succeeds against its own temp file, so the result is one
+        // complete payload rather than an interleaving of several.
+        let on_disk = fs::read_to_string(&file_path).unwrap();
+        assert!(contents.contains(&on_disk));
+
+        let leftovers: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "stale temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn test_atomic_write_failure_returns_err_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("pad_1.md");
+        atomic_write(&file_path, "original").unwrap();
+
+        fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = atomic_write(&file_path, "lost?");
+        fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Root ignores directory permissions; nothing to assert in that case.
+        if result.is_ok() {
+            return;
+        }
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original");
+        let names: Vec<_> = fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["pad_1.md"]);
     }
 
     #[test]

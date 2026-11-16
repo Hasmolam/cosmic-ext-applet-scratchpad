@@ -9,6 +9,7 @@ action-clear = Clear
 action-undo = Undo
 status-saved = Saved
 status-editing = Editing...
+status-save-failed = Save failed
 status-count = { $words } words · { $chars } chars
 banner-cleared = Note cleared.
 banner-deleted = Note deleted.

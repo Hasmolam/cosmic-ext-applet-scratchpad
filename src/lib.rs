@@ -1187,10 +1187,21 @@ impl cosmic::Application for ScratchpadApp {
                 active_note.title
             );
 
-            let title_btn = button::text(note_counter_title)
+            // The title takes whatever width the icons leave and ellipsizes on
+            // one line, so a long title cannot push the action icons off the
+            // popup.
+            let title_label = text::body(note_counter_title)
+                .wrapping(cosmic::iced::core::text::Wrapping::None)
+                .ellipsize(cosmic::iced::core::text::Ellipsize::End(
+                    cosmic::iced::core::text::EllipsizeHeightLimit::Lines(1),
+                ))
+                .width(Length::Fill);
+
+            let title_btn = button::custom(title_label)
                 .on_press(Message::ToggleSearch)
                 .class(theme::Button::Text)
-                .padding([4, 8]);
+                .padding([4, 8])
+                .width(Length::Fill);
 
             let title_with_tooltip = tooltip(
                 title_btn,
@@ -1229,7 +1240,8 @@ impl cosmic::Application for ScratchpadApp {
                 title_with_tooltip,
             ]
             .spacing(2)
-            .align_y(Alignment::Center);
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
 
             // Right Quick Actions
             let search_btn = button::custom(
@@ -1321,13 +1333,10 @@ impl cosmic::Application for ScratchpadApp {
             .spacing(2)
             .align_y(Alignment::Center);
 
-            let header = row![
-                nav_group,
-                space::horizontal().width(Length::Fill),
-                actions_row
-            ]
-            .align_y(Alignment::Center)
-            .width(Length::Fill);
+            let header = row![nav_group, actions_row]
+                .spacing(2)
+                .align_y(Alignment::Center)
+                .width(Length::Fill);
 
             // 2. Settings Drawer (Collapsible)
             let maybe_settings_drawer: Option<Element<_>> = if self.show_settings {

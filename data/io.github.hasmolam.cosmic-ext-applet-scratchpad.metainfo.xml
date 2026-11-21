@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.hasmolam.cosmic-ext-applet-scratchpad</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>Scratchpad</name>
+  <summary>Quick notes and scratchpad applet for the COSMIC desktop</summary>
+  <description>
+    <p>Scratchpad is a panel applet for the COSMIC desktop that stores quick notes, commands, and snippets as plain Markdown files.</p>
+    <p>It supports live search and instant note creation, keyboard navigation, clipboard copy and paste, asynchronous atomic saves with external edit reload and conflict protection, soft-delete trash with undo, and configurable word wrap and font size.</p>
+  </description>
+  <launchable type="desktop-id">io.github.hasmolam.cosmic-ext-applet-scratchpad.desktop</launchable>
+  <provides>
+    <id>com.system76.CosmicApplet</id>
+    <binary>cosmic-ext-applet-scratchpad</binary>
+  </provides>
+  <categories>
+    <category>COSMIC</category>
+  </categories>
+  <url type="homepage">https://github.com/Hasmolam/cosmic-ext-applet-scratchpad</url>
+  <url type="bugtracker">https://github.com/Hasmolam/cosmic-ext-applet-scratchpad/issues</url>
+  <developer id="io.github.hasmolam">
+    <name>Hasan Hüseyin Yolcu</name>
+  </developer>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.2.5" date="2026-11-09" />
+  </releases>
+</component>

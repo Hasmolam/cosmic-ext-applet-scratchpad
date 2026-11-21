@@ -15,43 +15,36 @@ fn default_font_size() -> f32 {
     14.0
 }
 
-fn default_tab_names() -> [String; 3] {
-    [
-        "Notes".to_string(),
-        "Snippets".to_string(),
-        "Scratch".to_string(),
-    ]
+fn default_trash_retention_days() -> u32 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, CosmicConfigEntry, PartialEq)]
 #[version = 1]
 pub struct ScratchpadConfig {
-    #[serde(default)]
-    pub active_tab: usize,
     #[serde(default = "default_wrap_lines")]
     pub wrap_lines: bool,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
-    #[serde(default = "default_tab_names")]
-    pub tab_names: [String; 3],
     #[serde(default)]
     pub active_file: Option<String>,
+    #[serde(default = "default_trash_retention_days")]
+    pub trash_retention_days: u32,
 }
 
 impl Default for ScratchpadConfig {
     fn default() -> Self {
         Self {
-            active_tab: 0,
             wrap_lines: default_wrap_lines(),
             font_size: default_font_size(),
-            tab_names: default_tab_names(),
             active_file: None,
+            trash_retention_days: default_trash_retention_days(),
         }
     }
 }
 
 impl ScratchpadConfig {
-    /// Sanitizes configuration values ensuring font_size is within valid bounds.
+    /// Sanitizes configuration values within valid bounds.
     pub fn sanitize(&mut self) {
         if self.font_size.is_nan() || self.font_size < 10.0 || self.font_size > 24.0 {
             self.font_size = if self.font_size.is_nan() {
@@ -60,6 +53,7 @@ impl ScratchpadConfig {
                 self.font_size.clamp(10.0, 24.0)
             };
         }
+        self.trash_retention_days = self.trash_retention_days.min(3650);
     }
 }
 
@@ -68,9 +62,13 @@ pub fn load_config() -> (Option<Config>, ScratchpadConfig) {
         Ok(handler) => {
             let mut config = match ScratchpadConfig::get_entry(&handler) {
                 Ok(cfg) => cfg,
-                Err(err) => {
-                    tracing::debug!(?err, "Could not read config entry, using defaults");
-                    ScratchpadConfig::default()
+                Err((errs, partial)) => {
+                    for e in errs {
+                        if e.is_err() {
+                            tracing::warn!(%e, "config");
+                        }
+                    }
+                    partial
                 }
             };
             config.sanitize();
@@ -98,10 +96,51 @@ pub mod tests {
             serde_json::from_str(&serialized).expect("Failed to deserialize ScratchpadConfig");
 
         assert_eq!(default_config, deserialized);
-        assert_eq!(deserialized.active_tab, 0);
         assert!(deserialized.wrap_lines);
-        assert_eq!(deserialized.tab_names.len(), 3);
         assert_eq!(deserialized.active_file, None);
+        assert_eq!(deserialized.trash_retention_days, 30);
+    }
+
+    #[test]
+    fn test_config_legacy_json_with_tab_names_deserializes() {
+        let legacy = r#"{
+            "active_tab": 2,
+            "wrap_lines": false,
+            "font_size": 16.0,
+            "tab_names": ["Notes", "Snippets", "Scratch"],
+            "active_file": "pad_3.md"
+        }"#;
+        let cfg: ScratchpadConfig =
+            serde_json::from_str(legacy).expect("Legacy config JSON should deserialize");
+
+        assert!(!cfg.wrap_lines);
+        assert_eq!(cfg.font_size, 16.0);
+        assert_eq!(cfg.active_file.as_deref(), Some("pad_3.md"));
+        assert_eq!(cfg.trash_retention_days, 30);
+    }
+
+    #[test]
+    fn test_config_trash_retention_days_sanitize() {
+        let mut cfg_zero = ScratchpadConfig {
+            trash_retention_days: 0,
+            ..Default::default()
+        };
+        cfg_zero.sanitize();
+        assert_eq!(cfg_zero.trash_retention_days, 0);
+
+        let mut cfg_normal = ScratchpadConfig {
+            trash_retention_days: 90,
+            ..Default::default()
+        };
+        cfg_normal.sanitize();
+        assert_eq!(cfg_normal.trash_retention_days, 90);
+
+        let mut cfg_huge = ScratchpadConfig {
+            trash_retention_days: 10_000,
+            ..Default::default()
+        };
+        cfg_huge.sanitize();
+        assert_eq!(cfg_huge.trash_retention_days, 3650);
     }
 
     #[test]

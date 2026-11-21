@@ -5,7 +5,7 @@ use cosmic::cctk::wayland_client::{
     protocol::{wl_keyboard, wl_registry, wl_seat},
 };
 use cosmic::iced::core::keyboard::{
-    Key,
+    Key, Modifiers,
     key::{Code, Named, NativeCode, Physical},
 };
 use std::collections::HashMap;
@@ -618,6 +618,49 @@ fn unshifted_code_to_evdev_scancode(physical: Physical) -> Option<u32> {
     Some(scancode)
 }
 
+const PREVIEW_MAX_CHARS: usize = 42;
+
+/// Application keyboard shortcuts independent of text-editor bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortcut {
+    Escape,
+    ToggleSearch,
+    NewNote,
+    PrevNote,
+    NextNote,
+    CopyAll,
+}
+
+/// Resolves a key press and modifier state into an application [`Shortcut`].
+pub fn shortcut_for(key: &Key, modifiers: Modifiers) -> Option<Shortcut> {
+    match key.as_ref() {
+        Key::Named(Named::Escape) if modifiers.is_empty() => Some(Shortcut::Escape),
+        Key::Named(Named::ArrowLeft)
+            if modifiers.alt()
+                && !modifiers.control()
+                && !modifiers.logo()
+                && !modifiers.shift() =>
+        {
+            Some(Shortcut::PrevNote)
+        }
+        Key::Named(Named::ArrowRight)
+            if modifiers.alt()
+                && !modifiers.control()
+                && !modifiers.logo()
+                && !modifiers.shift() =>
+        {
+            Some(Shortcut::NextNote)
+        }
+        _ if !modifiers.command() || modifiers.alt() => None,
+        Key::Character("f" | "F" | "k" | "K") => Some(Shortcut::ToggleSearch),
+        Key::Character("n" | "N") => Some(Shortcut::NewNote),
+        Key::Character("[") => Some(Shortcut::PrevNote),
+        Key::Character("]") => Some(Shortcut::NextNote),
+        Key::Character("c" | "C") if modifiers.shift() => Some(Shortcut::CopyAll),
+        _ => None,
+    }
+}
+
 /// Calculates word and character count for any UTF-8 text string.
 pub fn count_words_and_chars(text: &str) -> (usize, usize) {
     let trimmed = text.trim();
@@ -629,23 +672,22 @@ pub fn count_words_and_chars(text: &str) -> (usize, usize) {
     (words, chars)
 }
 
-/// Extracts a clean preview snippet from note content.
-/// If `query` is non-empty, finds the line matching query.
-/// Otherwise returns the second line (after title) or first line.
-pub fn get_preview_snippet(text: &str, query: &str) -> String {
-    let query_lower = query.trim().to_lowercase();
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}…", s[..idx].trim_end()),
+        None => s.to_string(),
+    }
+}
+
+/// Extracts a clean preview snippet from note content using a pre-trimmed,
+/// lowercased search query.
+pub fn get_preview_snippet_lower(text: &str, query_lower: &str) -> String {
     if !query_lower.is_empty() {
         for line in text.lines() {
             let trimmed = line.trim();
-            if trimmed.to_lowercase().contains(&query_lower) {
+            if trimmed.to_lowercase().contains(query_lower) {
                 let cleaned = trimmed.trim_start_matches('#').trim();
-                let chars: Vec<char> = cleaned.chars().collect();
-                return if chars.len() > 42 {
-                    let s: String = chars.into_iter().take(42).collect();
-                    format!("{}…", s.trim_end())
-                } else {
-                    cleaned.to_string()
-                };
+                return truncate_chars(cleaned, PREVIEW_MAX_CHARS);
             }
         }
     }
@@ -657,16 +699,17 @@ pub fn get_preview_snippet(text: &str, query: &str) -> String {
 
     let _title_line = non_empty_lines.next();
     if let Some(body_line) = non_empty_lines.next() {
-        let chars: Vec<char> = body_line.chars().collect();
-        if chars.len() > 42 {
-            let s: String = chars.into_iter().take(42).collect();
-            format!("{}…", s.trim_end())
-        } else {
-            body_line.to_string()
-        }
+        truncate_chars(body_line, PREVIEW_MAX_CHARS)
     } else {
         "…".to_string()
     }
+}
+
+/// Extracts a clean preview snippet from note content.
+/// If `query` is non-empty, finds the line matching query.
+/// Otherwise returns the second line (after title) or first line.
+pub fn get_preview_snippet(text: &str, query: &str) -> String {
+    get_preview_snippet_lower(text, &query.trim().to_lowercase())
 }
 
 #[cfg(test)]
@@ -707,6 +750,147 @@ pub mod tests {
         assert_eq!(
             get_preview_snippet(multiline, ""),
             "First line of body text here"
+        );
+    }
+
+    fn char_key(s: &str) -> Key {
+        Key::Character(s.into())
+    }
+
+    #[test]
+    fn test_shortcut_for_all_variants() {
+        let cmd = Modifiers::COMMAND;
+
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::Escape), Modifiers::empty()),
+            Some(Shortcut::Escape)
+        );
+        for k in ["f", "F", "k", "K"] {
+            assert_eq!(
+                shortcut_for(&char_key(k), cmd),
+                Some(Shortcut::ToggleSearch),
+                "expected ToggleSearch for cmd+{k}"
+            );
+        }
+        for k in ["n", "N"] {
+            assert_eq!(
+                shortcut_for(&char_key(k), cmd),
+                Some(Shortcut::NewNote),
+                "expected NewNote for cmd+{k}"
+            );
+        }
+        assert_eq!(shortcut_for(&char_key("["), cmd), Some(Shortcut::PrevNote));
+        assert_eq!(shortcut_for(&char_key("]"), cmd), Some(Shortcut::NextNote));
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::ArrowLeft), Modifiers::ALT),
+            Some(Shortcut::PrevNote)
+        );
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::ArrowRight), Modifiers::ALT),
+            Some(Shortcut::NextNote)
+        );
+        for k in ["c", "C"] {
+            assert_eq!(
+                shortcut_for(&char_key(k), cmd | Modifiers::SHIFT),
+                Some(Shortcut::CopyAll),
+                "expected CopyAll for cmd+shift+{k}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_shortcut_for_negative_cases() {
+        let cmd = Modifiers::COMMAND;
+
+        assert_eq!(shortcut_for(&Key::Named(Named::ArrowLeft), cmd), None);
+        assert_eq!(shortcut_for(&Key::Named(Named::ArrowRight), cmd), None);
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::ArrowLeft), cmd | Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::ArrowRight), cmd | Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(
+            shortcut_for(
+                &Key::Named(Named::ArrowLeft),
+                Modifiers::ALT | Modifiers::SHIFT
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_for(
+                &Key::Named(Named::ArrowRight),
+                Modifiers::ALT | Modifiers::SHIFT
+            ),
+            None
+        );
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::ArrowLeft), cmd | Modifiers::ALT),
+            None
+        );
+        assert_eq!(shortcut_for(&char_key("f"), cmd | Modifiers::ALT), None);
+        assert_eq!(shortcut_for(&char_key("c"), cmd), None);
+        for k in ["f", "k", "n", "[", "]", "c", "a"] {
+            assert_eq!(shortcut_for(&char_key(k), Modifiers::empty()), None);
+            assert_eq!(shortcut_for(&char_key(k), Modifiers::SHIFT), None);
+        }
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::Escape), Modifiers::SHIFT),
+            None
+        );
+        assert_eq!(shortcut_for(&Key::Named(Named::Escape), cmd), None);
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::Escape), Modifiers::ALT),
+            None
+        );
+        assert_eq!(
+            shortcut_for(&Key::Named(Named::Escape), Modifiers::LOGO),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_preview_snippet_lower() {
+        let text = "# Başlık\nİkinci satır burada\nAction: çay ve şeker al";
+        assert_eq!(
+            get_preview_snippet_lower(text, "şeker"),
+            "Action: çay ve şeker al"
+        );
+        assert_eq!(
+            get_preview_snippet_lower("## Başlık eşleşmesi\nGövde", "başlık"),
+            "Başlık eşleşmesi"
+        );
+        assert_eq!(get_preview_snippet_lower(text, ""), "İkinci satır burada");
+        assert_eq!(get_preview_snippet_lower("# Only Title", ""), "…");
+
+        let exact_42 = "çğıöşü".repeat(7);
+        assert_eq!(exact_42.chars().count(), 42);
+        let exact_note = format!("# Title\n{exact_42}");
+        assert_eq!(get_preview_snippet_lower(&exact_note, ""), exact_42);
+
+        let long_utf8 = format!("{}    extra", "çğıöşü".repeat(7));
+        let long_note = format!("# Title\n{long_utf8}");
+        assert_eq!(
+            get_preview_snippet_lower(&long_note, ""),
+            format!("{exact_42}…")
+        );
+
+        let long_match_line = format!("## {}   devam", "ğüşıöç".repeat(7));
+        assert_eq!(
+            get_preview_snippet_lower(&long_match_line, "devam"),
+            format!("{}…", "ğüşıöç".repeat(7))
+        );
+
+        let spaced_cutoff = format!("# Title\n{}   extra", "a".repeat(39));
+        assert_eq!(
+            get_preview_snippet_lower(&spaced_cutoff, ""),
+            format!("{}…", "a".repeat(39))
+        );
+        assert_eq!(
+            get_preview_snippet_lower("# Title\nBody line", "nomatch"),
+            "Body line"
         );
     }
 

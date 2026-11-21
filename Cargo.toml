@@ -29,12 +29,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Localization (Fluent)
-i18n-embed = { version = "0.15", features = ["fluent-system", "desktop-requester"] }
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"
 rust-embed = "8.5"
 
-# Async runtime primitives
-tokio = { version = "1", features = ["time", "macros", "rt"] }
+# Async runtime primitives & filesystem watcher
+tokio = { version = "1", features = ["time", "macros", "rt", "sync"] }
+notify = "8"
 
 # XKB layout resolution for AltGr (Level3/Level4) symbol input
 xkbcommon = "0.8"
@@ -42,4 +43,9 @@ xkbcommon = "0.8"
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"
 

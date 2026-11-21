@@ -1,35 +1,35 @@
 # cosmic-ext-applet-scratchpad
 
-Minimalist quick notes and scratchpad applet for the COSMIC Desktop environment.
+Quick notes and scratchpad applet for the COSMIC desktop environment.
 
-Provides immediate access to three separate scratchpads directly from the COSMIC panel.
+Provides direct access to unlimited plain-Markdown notes from the COSMIC panel.
 
 ![COSMIC Scratchpad Applet](screenshots/screenshot_main.png)
 
 ## Features
 
-- **Dynamic Note Navigation:** Sequential navigation (`<` Previous, `>` Next, `+` New Note) supporting arbitrary numbers of notes (`pad_N.md`), maintaining backward compatibility with existing 3-pad setups.
-- **Notational Velocity Search & Instant Create:** Integrated live search (`Ctrl+F` / `Ctrl+K` or clicking search / note title). Filters note titles and body content in real time. Pressing `Enter` or clicking create instantiates a new note immediately with the query as title.
-- **Title Derivation:** Dynamically derives note title from the first non-empty Markdown header or text line without requiring a database.
-- **Crash-Resilient Atomic Storage:** Notes are stored as plain Markdown files (`pad_N.md`) under `$XDG_DATA_HOME/cosmic-scratchpad/`. All writes write to a PID-tagged temporary file first, fsync, and atomic rename.
-- **Non-Destructive Delete & Undo:** Deleting a note moves it safely to the `trash/` subdirectory and displays a 5-second inline banner allowing immediate undo.
-- **Debounced Asynchronous Auto-Save:** Content saves asynchronously in a background thread 400ms after typing stops, or immediately when closing the popup or switching notes without UI stutter.
-- **External Modification Sync:** Monitors file modification timestamps (`mtime`) and reloads external disk changes upon popup open.
-- **One-Click Copy:** Copies current note text to the system clipboard with transient visual confirmation (`Ctrl+Shift+C`).
-- **Word & Character Counter:** Real-time statistics displayed in the footer.
-- **Settings Drawer:** In-app word wrap toggle and font size stepper (10pt - 24pt).
-- **Native COSMIC Integration:** Uses `libcosmic` widgets, adaptive system theming, and `cosmic-config`.
+- **Dynamic Note Navigation:** Sequential navigation (`<` Previous, `>` Next, `+` New Note) over arbitrary numbers of notes (`pad_N.md`), keeping compatibility with existing 3-pad setups.
+- **Notational Velocity Search & Instant Create:** Live search (`Ctrl+F` / `Ctrl+K` or clicking search / note title) filters titles and body text. Pressing `Enter` or clicking create opens a new note with the query as title.
+- **Title Derivation:** Derives each note title from its first non-empty Markdown heading or text line without a database.
+- **Atomic Storage & Private Permissions:** Notes are stored as plain Markdown files (`pad_N.md`) under `$XDG_DATA_HOME/cosmic-scratchpad/` with private `0700` directory and `0600` file permissions. Writes go to a temporary file, fsync, and atomically rename.
+- **Non-Destructive Delete & Undo:** Deleting a note moves it to `trash/` and shows a 5-second inline undo banner. Trashed files older than `trash_retention_days` (default `30`) are purged automatically.
+- **Debounced Asynchronous Auto-Save:** Saves in the background 400 ms after typing stops, or immediately when closing the popup or switching notes.
+- **External Modification Sync & Conflict Protection:** Checks modification timestamps (`mtime`) on popup open and reloads external disk edits automatically. If both the editor buffer and the file on disk change concurrently, writes the local buffer to `<stem>.conflict-<timestamp>.md` (`0600`) and reloads the disk version without discarding either edit.
+- **Clipboard Copy & Paste:** Toolbar Paste button (`Ctrl+V` in editor) and Copy All button (`Ctrl+Shift+C`) with transient status confirmation.
+- **Word & Character Counter:** Live counts displayed in the footer.
+- **Settings Drawer:** In-app word wrap toggle and font size controls (`10pt` - `24pt`).
+- **Native COSMIC Integration:** Uses `libcosmic` widgets, system theming, `cosmic-config`, and AppStream metadata (`com.system76.CosmicApplet`).
 
 ## Storage & Synchronization
 
-- **Note Data Directory:** `~/.local/share/cosmic-scratchpad/` (`pad_1.md`, `pad_2.md`, ...)
-- **Trash Directory:** `~/.local/share/cosmic-scratchpad/trash/`
-- **Configuration:** `~/.config/cosmic/io.github.hasmolam.cosmic-ext-applet-scratchpad/v1/config.ron`
+- **Note Data Directory:** `$XDG_DATA_HOME/cosmic-scratchpad/` (defaults to `~/.local/share/cosmic-scratchpad/`, falling back to `$XDG_RUNTIME_DIR/cosmic-scratchpad/` if `XDG_DATA_HOME` and `HOME` are unset). Directory mode `0700`, file mode `0600`.
+- **Trash Directory:** `$XDG_DATA_HOME/cosmic-scratchpad/trash/` (`0700`). Controlled by `trash_retention_days` (default `30` days; `0` disables automatic purging).
+- **Configuration:** `$XDG_CONFIG_HOME/cosmic/io.github.hasmolam.cosmic-ext-applet-scratchpad/v1/` (per-key RON files: `wrap_lines`, `font_size`, `active_file`, `trash_retention_days`).
 
-Because notes are stored as standard Markdown files without database wrappers or proprietary schemas:
-- **External Editing:** Files can be inspected or edited directly via terminal tools (`cat`, `nvim`, `nano`), GUI editors, or external note tools (Obsidian, VS Code).
-- **External Sync:** The directory can be synchronized across machines using Syncthing, Git, Dropbox, or Nextcloud. External edits are detected and refreshed automatically when opening the popup.
-- **Safety:** Deleted notes are preserved under `trash/`.
+Because notes are plain Markdown files without database wrappers:
+- **External Editing:** Files can be edited directly via terminal tools (`cat`, `nvim`, `nano`) or external Markdown tools (Obsidian, VS Code).
+- **External Sync:** The directory can be synchronized across machines with Syncthing, Git, Dropbox, or Nextcloud. External edits reload automatically on popup open and while running.
+- **Conflict Handling:** Concurrent edits produce `<stem>.conflict-<timestamp>.md` alongside the original note so neither copy is overwritten.
 
 ## Keyboard Shortcuts
 
@@ -40,21 +40,64 @@ Because notes are stored as standard Markdown files without database wrappers or
 | `Ctrl+[` / `Alt+Left` | Popup / Editor | Switch to previous note |
 | `Ctrl+]` / `Alt+Right` | Popup / Editor | Switch to next note |
 | `Ctrl+Shift+C` | Popup / Editor | Copy active note buffer to system clipboard |
+| `Ctrl+V` / Paste button | Editor / Toolbar | Paste clipboard text at cursor |
 | `Escape` | Search View | Exit search and return to editor |
-| `Escape` | Editor | Close applet popover and flush unsaved edits |
-| Standard navigation | Editor | Text motions (`Ctrl+A`, `Ctrl+Z`, `Ctrl+C`, `Ctrl+V`, cursor keys) |
+| `Escape` | Editor | Close applet popup and flush unsaved edits |
+| `Ctrl+Left` / `Ctrl+Right` | Editor | Move cursor by word |
+| Standard navigation | Editor | Selection, copy/cut/paste, undo/redo (`Ctrl+A`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `Ctrl+Z`, cursor keys) |
 
 ## Installation
 
-### Method 1: Single-Line Quick Install
+Prebuilt `x86_64` and `aarch64` Linux binaries, release tarballs, and `SHA256SUMS` are published on GitHub Releases.
 
-Downloads the prebuilt release binary, installs desktop entry and icons, and reloads the panel (no root required):
+### Method 1: Quick Install Script
+
+Downloads the architecture-matched release binary (`x86_64` or `aarch64`), verifies its SHA-256 digest against `SHA256SUMS`, and installs the binary, desktop entry, AppStream metainfo, and symbolic icon under `~/.local/` (no root required):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchpad/main/install.sh | bash
+# Download and run interactively (prompts before restarting cosmic-panel):
+curl -fsSLO https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchpad/main/install.sh
+chmod +x install.sh
+./install.sh
 ```
 
-### Method 2: Arch Linux (PKGBUILD)
+When piped (`curl ... | bash`), `install.sh` does not restart `cosmic-panel` unless `--yes` is passed; either pass `--yes` or run `killall cosmic-panel` afterwards:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchpad/main/install.sh | bash -s -- --yes
+```
+
+Flags:
+- `-y`, `--yes`: restart `cosmic-panel` without prompting
+- `--no-restart`: skip restarting `cosmic-panel`
+- `-h`, `--help`: print usage
+
+### Method 2: Manual Install from Release Tarball (No Cargo/Just Required)
+
+Download the tarball and `SHA256SUMS` for `x86_64` or `aarch64`, verify the checksum, and install the files directly:
+
+```bash
+# Replace <arch> with x86_64 or aarch64
+curl -fsSLO https://github.com/Hasmolam/cosmic-ext-applet-scratchpad/releases/latest/download/cosmic-ext-applet-scratchpad-<arch>-linux.tar.gz
+curl -fsSLO https://github.com/Hasmolam/cosmic-ext-applet-scratchpad/releases/latest/download/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+
+mkdir -p scratchpad-release
+tar -xzf cosmic-ext-applet-scratchpad-<arch>-linux.tar.gz -C scratchpad-release
+cd scratchpad-release
+
+mkdir -p ~/.local/bin ~/.local/share/applications ~/.local/share/metainfo ~/.local/share/icons/hicolor/scalable/apps
+install -Dm0755 cosmic-ext-applet-scratchpad ~/.local/bin/cosmic-ext-applet-scratchpad
+install -Dm0644 data/io.github.hasmolam.cosmic-ext-applet-scratchpad.desktop ~/.local/share/applications/io.github.hasmolam.cosmic-ext-applet-scratchpad.desktop
+install -Dm0644 data/io.github.hasmolam.cosmic-ext-applet-scratchpad.metainfo.xml ~/.local/share/metainfo/io.github.hasmolam.cosmic-ext-applet-scratchpad.metainfo.xml
+install -Dm0644 data/icons/scalable/apps/io.github.hasmolam.cosmic-ext-applet-scratchpad-symbolic.svg ~/.local/share/icons/hicolor/scalable/apps/io.github.hasmolam.cosmic-ext-applet-scratchpad-symbolic.svg
+
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
+killall cosmic-panel
+```
+
+### Method 3: Arch Linux (PKGBUILD)
 
 ```bash
 git clone https://github.com/Hasmolam/cosmic-ext-applet-scratchpad.git
@@ -62,7 +105,7 @@ cd cosmic-ext-applet-scratchpad/packaging/arch
 makepkg -si
 ```
 
-### Method 3: Build from Source
+### Method 4: Build from Source
 
 #### Build Dependencies (Ubuntu/Pop!_OS)
 
@@ -82,6 +125,13 @@ sudo just install
 
 # Or user-local installation (installs to ~/.local, no root required):
 just install-user
+```
+
+For offline/packaged builds using vendored dependencies:
+
+```bash
+just vendor
+just build-vendored
 ```
 
 ### Adding to the Panel
@@ -111,21 +161,22 @@ In COSMIC Desktop settings:
 
 ## Uninstallation
 
-If installed via the one-line quick installer:
+If installed via the quick install script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchpad/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Hasmolam/cosmic-ext-applet-scratchpad/main/uninstall.sh | bash -s -- --yes
 ```
 
-Or from a local repository clone:
+Or from a local repository clone or unpacked release tarball:
 
 ```bash
+./uninstall.sh
+# or via just:
 sudo just uninstall
-# or for user-local install:
 just uninstall-user
 ```
 
-*(Note: User notes in `~/.local/share/cosmic-scratchpad/` are preserved).*
+User notes in `~/.local/share/cosmic-scratchpad/` are preserved.
 
 ## Development
 

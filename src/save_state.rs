@@ -82,6 +82,19 @@ impl SaveState {
         self.pending = false;
         follow_up
     }
+
+    /// Marks an in-flight write as resolved after a conflict (e.g. saved to a
+    /// sibling conflict file and reloaded from disk), clearing pending retries.
+    pub fn resolve_conflict(&mut self, revision: u64) -> bool {
+        if self.in_flight != Some(revision) {
+            return false;
+        }
+        self.in_flight = None;
+        self.saved_revision = self.revision;
+        self.pending = false;
+        self.failed = false;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +206,45 @@ mod tests {
         let before = state.clone();
         assert!(!state.finish(rev + 7, true));
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn resolve_conflict_marks_current_revision_saved() {
+        let mut state = SaveState::default();
+        state.mark_edited();
+        let rev = state.begin().unwrap();
+
+        assert!(state.resolve_conflict(rev));
+        assert!(state.is_saved());
+        assert!(!state.is_in_flight());
+        assert!(!state.has_failed());
+        assert_eq!(state.begin(), None);
+    }
+
+    #[test]
+    fn resolve_conflict_ignores_stale_or_idle_revision() {
+        let mut state = SaveState::default();
+        assert!(!state.resolve_conflict(0));
+
+        state.mark_edited();
+        let rev = state.begin().unwrap();
+        let before = state.clone();
+        assert!(!state.resolve_conflict(rev + 1));
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn resolve_conflict_clears_edits_made_during_flight() {
+        let mut state = SaveState::default();
+        state.mark_edited();
+        let rev = state.begin().unwrap();
+        state.mark_edited();
+        assert_eq!(state.begin(), None);
+
+        assert!(state.resolve_conflict(rev));
+        assert!(state.is_saved());
+        assert!(!state.is_in_flight());
+        assert!(!state.has_failed());
+        assert_eq!(state.begin(), None);
     }
 }

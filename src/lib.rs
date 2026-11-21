@@ -90,6 +90,12 @@ fn content_at_end(text: &str) -> Content {
     content
 }
 
+fn editor_damage_color(epoch: u64) -> cosmic::iced::Color {
+    let r = ((epoch & 0xFFFF) as f32) / 65536.0;
+    let g = (((epoch >> 16) & 0xFFFF) as f32) / 65536.0;
+    cosmic::iced::Color::from_rgba(r, g, 0.0, 0.0)
+}
+
 /// AltGr is tracked through `ALTGR_ACTIVE` because cosmic-panel drops the level-3
 /// modifier before keys reach the applet; Ctrl+Alt is the X11-style equivalent.
 fn altgr_held(modifiers: Modifiers) -> bool {
@@ -340,12 +346,18 @@ pub struct ScratchpadApp {
     /// overwrites one state with the other and the editor panics with
     /// "Downcast on stateless state" on the next rebuild.
     editor_id: cosmic::iced::core::widget::Id,
+    editor_paint_epoch: u64,
 }
 
 impl ScratchpadApp {
+    fn mark_editor_dirty(&mut self) {
+        self.editor_paint_epoch = self.editor_paint_epoch.wrapping_add(1);
+    }
+
     fn set_active(&mut self, index: usize) {
         self.active_index = index;
         self.config.active_file = self.notes.get(index).map(|n| n.filename.clone());
+        self.mark_editor_dirty();
     }
 
     fn update_note_meta(&mut self, index: usize) {
@@ -415,6 +427,7 @@ impl ScratchpadApp {
             }
         }
         if changed {
+            self.mark_editor_dirty();
             self.update_search_filter();
         }
     }
@@ -503,6 +516,7 @@ impl ScratchpadApp {
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| conflict_path.display().to_string());
                         self.notice_banner = Some(NoticeBanner::Conflict { filename });
+                        self.mark_editor_dirty();
                         self.update_search_filter();
                     }
                 }
@@ -990,6 +1004,7 @@ impl cosmic::Application for ScratchpadApp {
             search_results: Vec::new(),
             altgr_map: Arc::new(ui::AltGrMap::default()),
             editor_id: cosmic::iced::core::widget::Id::unique(),
+            editor_paint_epoch: 0,
         };
 
         let init_task = app::Task::future(async move {
@@ -1102,6 +1117,7 @@ impl cosmic::Application for ScratchpadApp {
                     return app::Task::batch([save_task, destroy_task]);
                 }
 
+                self.mark_editor_dirty();
                 let checks = self.collect_clean_note_checks();
                 let sync_task = app::Task::future(async move {
                     let res = tokio::task::spawn_blocking(move || {
@@ -1454,6 +1470,7 @@ impl cosmic::Application for ScratchpadApp {
                 }
 
                 if let Some(id) = edited_id {
+                    self.mark_editor_dirty();
                     self.update_note_meta(idx);
                     app::Task::future(async move {
                         tokio::time::sleep(Duration::from_millis(DEBOUNCE_MILLIS)).await;
@@ -2125,10 +2142,20 @@ impl cosmic::Application for ScratchpadApp {
                 .padding(10)
                 .on_action(Message::EditorAction);
 
+            let paint_epoch = self.editor_paint_epoch;
             let editor_container = container(editor)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .class(theme::Container::Card);
+                .class(theme::Container::custom(move |theme| {
+                    use cosmic::iced::widget::container::Catalog as _;
+                    let mut style = theme.style(&theme::Container::Card);
+                    // Workaround for iced_tiny_skia damage tracking: Text::Editor equality
+                    // checks only font/bounds/metrics, so swapping or replacing Content emits
+                    // no viewport damage. Varying the invisible zero-width transparent border
+                    // color breaks Quad equality and triggers a clean editor repaint.
+                    style.border.color = editor_damage_color(paint_epoch);
+                    style
+                }));
 
             // 5. Footer: Word & Character Counter (Left), Save Status (Right)
             let (words, chars) = active_note.word_chars;
@@ -2213,6 +2240,7 @@ mod tests {
             search_results: Vec::new(),
             altgr_map: Arc::new(ui::AltGrMap::default()),
             editor_id: Id::unique(),
+            editor_paint_epoch: 0,
         };
         app.set_active(0);
         app.update_search_filter();
@@ -2602,5 +2630,94 @@ mod tests {
         let cursor = content.cursor();
         assert_eq!(cursor.position.line, 1);
         assert_eq!(cursor.position.column, 3);
+    }
+
+    #[test]
+    fn editor_damage_color_produces_distinct_transparent_colors_for_consecutive_epochs() {
+        for epoch in [0_u64, 1, 2, 65_534, 65_535, 65_536, 65_537, u64::MAX - 1] {
+            let a = editor_damage_color(epoch);
+            let b = editor_damage_color(epoch.wrapping_add(1));
+            assert_eq!(a.a, 0.0);
+            assert_eq!(b.a, 0.0);
+            assert_ne!(a, b, "epoch {epoch} and next produced identical color");
+        }
+    }
+
+    #[test]
+    fn editor_paint_epoch_increments_on_note_switch_reload_conflict_edit_and_open() {
+        let mtime1 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mtime2 = mtime1 + Duration::from_secs(10);
+        let mut note0 = NoteItem::from_loaded(
+            0,
+            PathBuf::from("/tmp/pad_1.md"),
+            "first note",
+            "Note 1",
+            Some(mtime1),
+        );
+        note0.save.mark_edited();
+        let conflict_rev = note0.save.begin().unwrap();
+        let note1 = NoteItem::from_loaded(
+            1,
+            PathBuf::from("/tmp/pad_2.md"),
+            "second note",
+            "Note 2",
+            Some(mtime1),
+        );
+
+        let mut app = test_app(None, vec![note0, note1]);
+        let initial_epoch = app.editor_paint_epoch;
+        assert_eq!(initial_epoch, 1);
+
+        // set_active (note switch)
+        app.set_active(1);
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 1);
+
+        // apply_external_updates with no text change does not mark dirty
+        app.apply_external_updates(vec![ExternalNoteUpdate {
+            id: 1,
+            content: "second note".to_string(),
+            mtime: mtime2,
+        }]);
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 1);
+
+        // apply_external_updates with changed text marks dirty
+        app.apply_external_updates(vec![ExternalNoteUpdate {
+            id: 1,
+            content: "second note reloaded".to_string(),
+            mtime: mtime2 + Duration::from_secs(1),
+        }]);
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 2);
+
+        // SaveOutcome::Conflict marks dirty
+        let _ = app.handle_note_saved(
+            0,
+            conflict_rev,
+            SaveOutcome::Conflict {
+                conflict_path: PathBuf::from("/tmp/pad_1.conflict-1.md"),
+                disk_content: "remote content".to_string(),
+                disk_mtime: mtime2,
+            },
+        );
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 3);
+
+        // Non-edit EditorAction leaves epoch unchanged; edit actions increment it
+        let _ = app.update(Message::EditorAction(Action::Move(Motion::Left)));
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 3);
+
+        let _ = app.update(Message::EditorAction(Action::Edit(Edit::Insert('!'))));
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 4);
+
+        let _ = app.update(Message::EditorAction(Action::Edit(Edit::Paste(Arc::new(
+            " pasted".to_string(),
+        )))));
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 5);
+
+        // TogglePopup increments only when opening, not when closing
+        let _ = app.update(Message::TogglePopup);
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 6);
+
+        app.popup = Some(window::Id::unique());
+        let _ = app.update(Message::TogglePopup);
+        assert_eq!(app.editor_paint_epoch, initial_epoch + 6);
     }
 }

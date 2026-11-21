@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-ext-applet-scratchpad"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "i18n-embed",
  "i18n-embed-fl",

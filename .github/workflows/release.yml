@@ -6,12 +6,20 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Build and Release Binaries
-    runs-on: ubuntu-24.04
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout code
@@ -31,27 +39,61 @@ jobs:
         run: cargo build --release
 
       - name: Strip binary
-        run: |
-          strip target/release/cosmic-ext-applet-scratchpad
+        run: strip target/release/cosmic-ext-applet-scratchpad
 
-      - name: Package Release
+      - name: Package release artifacts
         run: |
-          mkdir -p release-pkg
-          cp target/release/cosmic-ext-applet-scratchpad release-pkg/
-          cp install.sh release-pkg/
-          cp uninstall.sh release-pkg/
-          cp README.md release-pkg/
+          mkdir -p artifacts release-pkg
+          cp target/release/cosmic-ext-applet-scratchpad release-pkg/cosmic-ext-applet-scratchpad
+          cp install.sh uninstall.sh README.md release-pkg/
           cp -r data release-pkg/
-          tar -czvf cosmic-ext-applet-scratchpad-x86_64-linux.tar.gz -C release-pkg .
+          tar -czvf "artifacts/cosmic-ext-applet-scratchpad-${{ matrix.arch }}-linux.tar.gz" -C release-pkg .
+          cp target/release/cosmic-ext-applet-scratchpad "artifacts/cosmic-ext-applet-scratchpad-${{ matrix.arch }}-linux"
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            cp target/release/cosmic-ext-applet-scratchpad artifacts/cosmic-ext-applet-scratchpad
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: artifacts/
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Copy installer scripts and generate checksums
+        run: |
+          cp install.sh uninstall.sh dist/
+          (cd dist && sha256sum cosmic-ext-applet-scratchpad* install.sh uninstall.sh > SHA256SUMS)
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'dist/cosmic-ext-applet-scratchpad*'
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: |
-            target/release/cosmic-ext-applet-scratchpad
-            cosmic-ext-applet-scratchpad-x86_64-linux.tar.gz
-            install.sh
-            uninstall.sh
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

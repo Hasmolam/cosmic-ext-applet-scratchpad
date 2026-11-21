@@ -22,9 +22,6 @@ fn default_trash_retention_days() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, CosmicConfigEntry, PartialEq)]
 #[version = 1]
 pub struct ScratchpadConfig {
-    // Wave 2 removes active_tab alongside src/lib.rs updates
-    #[serde(default)]
-    pub active_tab: usize,
     #[serde(default = "default_wrap_lines")]
     pub wrap_lines: bool,
     #[serde(default = "default_font_size")]
@@ -38,7 +35,6 @@ pub struct ScratchpadConfig {
 impl Default for ScratchpadConfig {
     fn default() -> Self {
         Self {
-            active_tab: 0,
             wrap_lines: default_wrap_lines(),
             font_size: default_font_size(),
             active_file: None,
@@ -100,7 +96,6 @@ pub mod tests {
             serde_json::from_str(&serialized).expect("Failed to deserialize ScratchpadConfig");
 
         assert_eq!(default_config, deserialized);
-        assert_eq!(deserialized.active_tab, 0);
         assert!(deserialized.wrap_lines);
         assert_eq!(deserialized.active_file, None);
         assert_eq!(deserialized.trash_retention_days, 30);
@@ -118,7 +113,6 @@ pub mod tests {
         let cfg: ScratchpadConfig =
             serde_json::from_str(legacy).expect("Legacy config JSON should deserialize");
 
-        assert_eq!(cfg.active_tab, 2);
         assert!(!cfg.wrap_lines);
         assert_eq!(cfg.font_size, 16.0);
         assert_eq!(cfg.active_file.as_deref(), Some("pad_3.md"));

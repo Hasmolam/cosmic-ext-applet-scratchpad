@@ -60,19 +60,6 @@ pub fn data_dir() -> io::Result<PathBuf> {
     data_dir_from_env(xdg_data.as_deref(), home.as_deref(), xdg_runtime.as_deref())
 }
 
-/// Directory for soft-deleted / trashed notes.
-pub fn trash_dir() -> io::Result<PathBuf> {
-    Ok(data_dir()?.join("trash"))
-}
-
-// Wave 2 removes pad_path alongside src/lib.rs updates.
-/// Returns the path to the Markdown file for the given pad index (0-indexed).
-pub fn pad_path(index: usize) -> PathBuf {
-    data_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!("pad_{}.md", index + 1))
-}
-
 /// Creates `dir` with mode `0700` if it does not exist yet, leaving parent
 /// directories (such as `~/.local/share`) with default permissions.
 fn ensure_private_dir(dir: &Path) -> io::Result<()> {
@@ -187,11 +174,6 @@ pub fn list_notes_in_dir(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(notes)
 }
 
-/// Lists all notes in the default data directory.
-pub fn list_notes() -> io::Result<Vec<PathBuf>> {
-    list_notes_in_dir(&data_dir()?)
-}
-
 /// Derives a clean note title from note content:
 /// Scans for first non-empty line, removes markdown headers/list symbols, and truncates if necessary.
 pub fn derive_title(content: &str, fallback: &str) -> String {
@@ -257,11 +239,6 @@ pub fn create_new_note_in_dir(dir: &Path, title_opt: Option<&str>) -> io::Result
 
     atomic_write(&new_path, &initial_content)?;
     Ok(new_path)
-}
-
-/// Creates a new note in the default data directory.
-pub fn create_new_note(title_opt: Option<&str>) -> io::Result<PathBuf> {
-    create_new_note_in_dir(&data_dir()?, title_opt)
 }
 
 static TRASH_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -381,7 +358,7 @@ pub fn purge_old_trash(
 /// Preserves symlinks by writing to the canonical path.
 /// Preserves existing file permissions, or uses `0600` for new files.
 /// Syncs file to disk and replaces target using atomic rename.
-pub fn atomic_write(target_path: &Path, content: &str) -> io::Result<()> {
+fn atomic_write(target_path: &Path, content: &str) -> io::Result<()> {
     let real_target = if target_path.exists() {
         fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf())
     } else {
@@ -540,12 +517,6 @@ pub fn load_note_if_modified(
 
     let content = fs::read_to_string(path)?;
     Ok(Some((content, mtime)))
-}
-
-// Wave 2 removes save_note_atomic alongside src/lib.rs updates.
-/// Saves the given note content atomically to disk.
-pub fn save_note_atomic(path: &Path, content: &str) -> io::Result<()> {
-    atomic_write(path, content)
 }
 
 #[cfg(test)]
@@ -1031,17 +1002,6 @@ pub mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["pad_1.md"]);
-    }
-
-    #[test]
-    fn test_pad_path_indexing() {
-        let p0 = pad_path(0);
-        let p1 = pad_path(1);
-        let p2 = pad_path(2);
-
-        assert!(p0.ends_with("pad_1.md"));
-        assert!(p1.ends_with("pad_2.md"));
-        assert!(p2.ends_with("pad_3.md"));
     }
 
     #[test]
